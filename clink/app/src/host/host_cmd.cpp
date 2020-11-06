@@ -293,6 +293,7 @@ bool host_cmd::initialise()
     };
     auto* as_stdcall = static_cast<DWORD (__stdcall *)(LPCWSTR, LPWSTR, DWORD)>(get_environment_variable_w);
     Detour_GetEnvironmentVariableW = hookptr_t(as_stdcall);
+    // Passes false for repair_iat so that detach() can be used!
     hooks.attach(nullptr, &Real_GetEnvironmentVariableW, "GetEnvironmentVariableW", Detour_GetEnvironmentVariableW, false/*repair_iat*/);
 
     rl_add_funmap_entry("clink-expand-env-var", expand_env_var);
@@ -491,9 +492,9 @@ BOOL WINAPI host_cmd::set_env_var(const wchar_t* name, const wchar_t* value)
 //------------------------------------------------------------------------------
 bool host_cmd::initialise_system()
 {
-    // Must hook the one in kernelbase.dll, not kernel32.dll.  CMD links with
-    // kernelbase.dll, but we link with kernel32.dll.  So using our ReadConsoleW
-    // IAT entry will only hook our own calls and miss CMD's calls.
+    // Must hook the one in kernelbase.dll, not kernel32.dll.  CMD links
+    // directly with kernelbase.dll, but we link with kernel32.dll.  So hooking
+    // our ReadConsoleW pointer wouldn't affect CMD.
     hook_setter hooks;
     hooks.attach("kernelbase.dll", &(PVOID&)Real_ReadConsoleW, "ReadConsoleW", &host_cmd::read_console, true/*repair_iat*/);
     if (!hooks.commit())

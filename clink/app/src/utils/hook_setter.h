@@ -3,6 +3,8 @@
 
 #pragma once
 
+struct repair_iat_node;
+
 //------------------------------------------------------------------------------
 class hook_setter
 {
@@ -10,7 +12,9 @@ public:
                                 hook_setter();
                                 ~hook_setter();
 
-    // WARNING:  detach() currently doesn't support detaching the local IAT!
+    // WARNING:  detach() isn't able to restore the IAT yet; DO NOT USE if
+    // attach() passed true for repair_iat!  Because of this safety restriction
+    // repair_iat defaults to false.
 
     bool                        attach(const char* module, PVOID* real, const char* name, PVOID hook, bool repair_iat=false);
     bool                        detach(PVOID* real, const char* name, PVOID hook);
@@ -20,15 +24,7 @@ private:
     void                        free_repair_list();
 
 private:
-    struct repair_node
-    {
-        repair_node* m_next;
-        PVOID m_iat;
-        PVOID m_trampoline;
-        const char* m_name;
-    };
-
-    repair_node*                m_repair_iat;
-
-    bool                        m_pending;
+    PVOID                       m_self = nullptr;
+    bool                        m_pending = false;
+    repair_iat_node*            m_repair_iat = nullptr;
 };
