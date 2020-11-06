@@ -7,50 +7,28 @@
 class hook_setter
 {
 public:
-    typedef void (__stdcall *hookptr_t)();
-
                                 hook_setter();
-    template <typename RET,
-             typename... ARGS>
-    bool                        add_iat(void* module, const char* name, RET (__stdcall *hook)(ARGS...));
-    template <typename RET,
-             typename... ARGS>
-    bool                        add_jmp(void* module, const char* name, RET (__stdcall *hook)(ARGS...));
-    int                         commit();
+                                ~hook_setter();
+
+    // WARNING:  detach() currently doesn't support detaching the local IAT!
+
+    bool                        attach(const char* module, PVOID* real, const char* name, PVOID hook, bool repair_iat=false);
+    bool                        detach(PVOID* real, const char* name, PVOID hook);
+    bool                        commit();
 
 private:
-    enum hook_type
+    void                        free_repair_list();
+
+private:
+    struct repair_node
     {
-        hook_type_iat_by_name,
-        //hook_type_iat_by_addr,
-        hook_type_jmp,
+        repair_node* m_next;
+        PVOID m_iat;
+        PVOID m_trampoline;
+        const char* m_name;
     };
 
-    struct hook_desc
-    {
-        void*                   module;
-        const char*             name;
-        hookptr_t               hook;
-        hook_type               type;
-    };
+    repair_node*                m_repair_iat;
 
-    hook_desc*                  add_desc(hook_type type, void* module, const char* name, hookptr_t hook);
-    bool                        commit_iat(void* self, const hook_desc& desc);
-    bool                        commit_jmp(void* self, const hook_desc& desc);
-    hook_desc                   m_descs[4];
-    int                         m_desc_count;
+    bool                        m_pending;
 };
-
-//------------------------------------------------------------------------------
-template <typename RET, typename... ARGS>
-bool hook_setter::add_iat(void* module, const char* name, RET (__stdcall *hook)(ARGS...))
-{
-    return (add_desc(hook_type_iat_by_name, module, name, hookptr_t(hook)) != nullptr);
-}
-
-//------------------------------------------------------------------------------
-template <typename RET, typename... ARGS>
-bool hook_setter::add_jmp(void* module, const char* name, RET (__stdcall *hook)(ARGS...))
-{
-    return (add_desc(hook_type_jmp, module, name, hookptr_t(hook)) != nullptr);
-}

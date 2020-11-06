@@ -9,99 +9,166 @@
 #include <process/hook.h>
 #include <process/pe.h>
 #include <process/vm.h>
+#include <detours.h>
 
 //------------------------------------------------------------------------------
 hook_setter::hook_setter()
-: m_desc_count(0)
 {
+    m_repair_iat = nullptr;
+
+    LONG err = DetourTransactionBegin();
+    m_pending = (err == NOERROR);
+
+    if (m_pending)
+        LOG("Started hook transaction.");
+    else
+        LOG("Unable to start hook transaction (error %u).", err);
 }
 
 //------------------------------------------------------------------------------
-int hook_setter::commit()
+hook_setter::~hook_setter()
 {
-    // Each hook needs fixing up, so we find the base address of our module.
-    void* self = vm().get_alloc_base("clink");
-    if (self == nullptr)
-        return 0;
+    if (m_pending)
+        DetourTransactionAbort();
+    free_repair_list();
+}
 
-    // Apply all the hooks add to the setter.
-    int success = 0;
-    for (int i = 0; i < m_desc_count; ++i)
+//------------------------------------------------------------------------------
+void* follow_jump(void* addr);
+bool hook_setter::attach(const char* module, PVOID* real, const char* name, PVOID detour, bool repair_iat)
+{
+    PVOID proc = *real;
+    PVOID iat = proc;
+
+    if (module)
     {
-        const hook_desc& desc = m_descs[i];
-        switch (desc.type)
+        LOG("Attempting to hook %s in %s with %p; local IAT at %p.", name, module, detour, iat);
+        proc = DetourFindFunction(module, name);
+        if (!proc)
         {
-        case hook_type_iat_by_name: success += !!commit_iat(self, desc);  break;
-        case hook_type_jmp:         success += !!commit_jmp(self, desc);  break;
+            LOG("Unable to find %s in %s.", name, module);
+            return false;
+        }
+    }
+    else
+    {
+        LOG("Attempting to hook %s with %p; local IAT at %p.", name, detour, iat);
+    }
+
+    // Get the target pointer to hook.
+    PVOID replace = follow_jump(proc);
+    if (!replace)
+    {
+        LOG("Unable to get target address.");
+        return false;
+    }
+
+    // If iat and replace are the same, then iat isn't really an IAT address and
+    // must not be repaired, since attempting to repair it would cancel out the
+    // original hook operation.
+    if (iat == replace)
+    {
+        LOG("Skipping request to repair own IAT; there doesn't seem to be an IAT entry at %p.", iat);
+        repair_iat = false;
+    }
+
+    // Hook the target pointer.
+    PDETOUR_TRAMPOLINE trampoline;
+    LONG err = DetourAttachEx(&replace, detour, &trampoline, nullptr, nullptr);
+    if (err != NOERROR)
+    {
+        LOG("Unable to hook %s (error %u).", name, err);
+        return false;
+    }
+
+    // Hook our IAT back to the original.
+    if (repair_iat)
+    {
+        repair_node *r = new repair_node;
+        r->m_iat = iat;
+        r->m_trampoline = trampoline;
+        r->m_name = name;
+        r->m_next = m_repair_iat;
+        m_repair_iat = r;
+    }
+
+    *real = trampoline;
+    return true;
+}
+
+//------------------------------------------------------------------------------
+bool hook_setter::detach(PVOID* real, const char* name, PVOID detour)
+{
+    LONG err = DetourDetach(real, detour);
+    if (err != NOERROR)
+    {
+        LOG("Unable to unhook %s (error %u).", name, err);
+        return false;
+    }
+
+    return true;
+}
+
+//------------------------------------------------------------------------------
+bool hook_setter::commit()
+{
+    LONG err = DetourTransactionCommit();
+    m_pending = false;
+
+    if (err != NOERROR)
+    {
+        LOG("Unable to commit hooks (error %u).", err);
+        return false;
+    }
+
+    bool success = true;
+    if (m_repair_iat)
+    {
+        err = DetourTransactionBegin();
+        if (err != NOERROR)
+        {
+            LOG("Unable to begin IAT repair transaction (error %u).", err);
+            return false;
+        }
+
+        while (m_repair_iat)
+        {
+            repair_node* r = m_repair_iat;
+            m_repair_iat = m_repair_iat->m_next;
+
+            err = DetourAttach(&r->m_iat, r->m_trampoline);
+            if (err != NOERROR)
+            {
+                LOG("Unable to repair IAT for %s to %p (error %u).", r->m_name, r->m_trampoline, err);
+                success = false;
+            }
+
+            delete r;
+        }
+
+        if (success)
+        {
+            err = DetourTransactionCommit();
+            if (err != NOERROR)
+            {
+                LOG("Unable to commit IAT repair hooks (error %u).", err);
+                success = false;
+            }
         }
     }
 
+    if (success)
+        LOG("Hook transaction committed.");
     return success;
 }
 
 //------------------------------------------------------------------------------
-hook_setter::hook_desc* hook_setter::add_desc(
-    hook_type type,
-    void* module,
-    const char* name,
-    hookptr_t hook)
+void hook_setter::free_repair_list()
 {
-    if (m_desc_count >= sizeof_array(m_descs))
-        return nullptr;
-
-    hook_desc& desc = m_descs[m_desc_count];
-    desc.type = type;
-    desc.module = module;
-    desc.hook = hook;
-    desc.name = name;
-
-    ++m_desc_count;
-    return &desc;
-}
-
-//------------------------------------------------------------------------------
-bool hook_setter::commit_iat(void* self, const hook_desc& desc)
-{
-    hookptr_t addr = hook_iat(desc.module, nullptr, desc.name, desc.hook, 1);
-    if (addr == nullptr)
+    while (m_repair_iat)
     {
-        LOG("Unable to hook %s in IAT at base %p", desc.name, desc.module);
-        return false;
+        repair_node* d = m_repair_iat;
+        m_repair_iat = m_repair_iat->m_next;
+        delete d;
     }
-
-    // If the target's IAT was hooked then the hook destination is now
-    // stored in 'addr'. We hook ourselves with this address to maintain
-    // any IAT hooks that may already exist.
-    if (hook_iat(self, nullptr, desc.name, addr, 1) == 0)
-    {
-        LOG("Failed to hook own IAT for %s", desc.name);
-        return false;
-    }
-
-    return true;
-}
-
-//------------------------------------------------------------------------------
-bool hook_setter::commit_jmp(void* self, const hook_desc& desc)
-{
-    // Hook into a DLL's import by patching the start of the function. 'addr' is
-    // the trampoline that can be used to call the original. This method doesn't
-    // use the IAT.
-
-    auto* addr = hook_jmp(desc.module, desc.name, desc.hook);
-    if (addr == nullptr)
-    {
-        LOG("Unable to hook %s in %p", desc.name, desc.module);
-        return false;
-    }
-
-    // Patch our own IAT with the address of a trampoline so out use of this
-    // function calls the original.
-    if (hook_iat(self, nullptr, desc.name, addr, 1) == 0)
-    {
-        LOG("Failed to hook own IAT for %s", desc.name);
-        return false;
-    }
-
-    return true;
 }
