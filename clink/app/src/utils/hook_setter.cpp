@@ -15,7 +15,7 @@ hook_setter::hook_setter()
 {
     LONG err = NOERROR;
 
-    // In order to repair out IAT, we need the base address of our module.
+    // In order to repair our IAT, we need the base address of our module.
     if (!err)
     {
         m_self = vm().get_alloc_base("clink");
@@ -47,6 +47,50 @@ hook_setter::~hook_setter()
     }
 
     free_repair_iat_list(m_repair_iat);
+}
+
+//------------------------------------------------------------------------------
+bool hook_setter::commit()
+{
+    m_pending = false;
+
+    // TODO: suspend threads?  Currently this relies on CMD being essentially
+    // single threaded.
+
+    LONG err = DetourTransactionCommit();
+    if (!err)
+    {
+        apply_repair_iat_list(m_repair_iat);
+    }
+    else
+    {
+        LOG("<<< Unable to commit hooks (error %u).", err);
+        free_repair_iat_list(m_repair_iat);
+        m_desc_count = 0;
+        return false;
+    }
+
+    // Apply any IAT hooks.
+    int failed = 0;
+    for (int i = 0; i < m_desc_count; ++i)
+    {
+        const hook_iat_desc& desc = m_descs[i];
+        failed += !commit_iat(m_self, desc);
+    }
+    m_desc_count = 0;
+
+    if (failed)
+    {
+        LOG("<<< Unable to commit hooks.");
+        return false;
+    }
+
+    LOG("<<< Hook transaction committed.");
+
+    // TODO: resume threads?  Currently this relies on CMD being essentially
+    // single threaded.
+
+    return true;
 }
 
 //------------------------------------------------------------------------------
@@ -99,50 +143,6 @@ bool hook_setter::add_detour(const char* module, const char* name, hookptr_t det
 
     // Hook our IAT back to the original.
     add_repair_iat_node(m_repair_iat, m_self, module, name, hookptr_t(trampoline));
-
-    return true;
-}
-
-//------------------------------------------------------------------------------
-bool hook_setter::commit()
-{
-    m_pending = false;
-
-    // TODO: suspend threads?  Currently this relies on CMD being essentially
-    // single threaded.
-
-    LONG err = DetourTransactionCommit();
-    if (!err)
-    {
-        apply_repair_iat_list(m_repair_iat);
-    }
-    else
-    {
-        LOG("<<< Unable to commit hooks (error %u).", err);
-        free_repair_iat_list(m_repair_iat);
-        m_desc_count = 0;
-        return false;
-    }
-
-    // Apply any IAT hooks.
-    int failed = 0;
-    for (int i = 0; i < m_desc_count; ++i)
-    {
-        const hook_iat_desc& desc = m_descs[i];
-        failed += !commit_iat(m_self, desc);
-    }
-    m_desc_count = 0;
-
-    if (failed)
-    {
-        LOG("<<< Unable to commit hooks.");
-        return false;
-    }
-
-    LOG("<<< Hook transaction committed.");
-
-    // TODO: resume threads?  Currently this relies on CMD being essentially
-    // single threaded.
 
     return true;
 }
