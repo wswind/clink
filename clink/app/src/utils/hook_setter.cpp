@@ -50,24 +50,34 @@ hook_setter::~hook_setter()
 }
 
 //------------------------------------------------------------------------------
-void* follow_jump(void* addr);
-bool hook_setter::attach(const char* module, PVOID* real, const char* name, PVOID detour, bool repair_iat)
+bool hook_setter::add_desc(const char* module, const char* name, hookptr_t hook)
 {
-    PVOID proc = *real;
-
-    if (module)
+    assert(m_desc_count < sizeof_array(m_descs));
+    if (m_desc_count >= sizeof_array(m_descs))
     {
-        LOG("Attempting to hook %s in %s with %p.", name, module, detour);
-        proc = DetourFindFunction(module, name);
-        if (!proc)
-        {
-            LOG("Unable to find %s in %s.", name, module);
-            return false;
-        }
+        assert(false);
+        return false;
     }
-    else
+
+    void* base = GetModuleHandleA(module);
+
+    hook_iat_desc& desc = m_descs[m_desc_count++];
+    desc.base = base;
+    desc.hook = hook;
+    desc.name = name;
+    return true;
+}
+
+//------------------------------------------------------------------------------
+void* follow_jump(void* addr);
+bool hook_setter::add_detour(const char* module, const char* name, hookptr_t detour)
+{
+    LOG("Attempting to hook %s in %s with %p.", name, module, detour);
+    PVOID proc = DetourFindFunction(module, name);
+    if (!proc)
     {
-        LOG("Attempting to hook %s with %p.", name, detour);
+        LOG("Unable to find %s in %s.", name, module);
+        return false;
     }
 
     // Get the target pointer to hook.
@@ -87,25 +97,8 @@ bool hook_setter::attach(const char* module, PVOID* real, const char* name, PVOI
         return false;
     }
 
-    // Hook our IAT back to the original if requested.
-    if (repair_iat)
-        add_repair_iat_node(m_repair_iat, m_self, module, name, hookptr_t(trampoline));
-
-    *real = trampoline;
-    return true;
-}
-
-//------------------------------------------------------------------------------
-bool hook_setter::detach(PVOID* real, const char* name, PVOID detour)
-{
-    LOG("Attempting to restore %s at %p.", name, *real);
-
-    LONG err = DetourDetach(real, detour);
-    if (err != NOERROR)
-    {
-        LOG("Unable to unhook %s (error %u).", name, err);
-        return false;
-    }
+    // Hook our IAT back to the original.
+    add_repair_iat_node(m_repair_iat, m_self, module, name, hookptr_t(trampoline));
 
     return true;
 }
@@ -113,24 +106,65 @@ bool hook_setter::detach(PVOID* real, const char* name, PVOID detour)
 //------------------------------------------------------------------------------
 bool hook_setter::commit()
 {
+    m_pending = false;
+
     // TODO: suspend threads?  Currently this relies on CMD being essentially
     // single threaded.
 
     LONG err = DetourTransactionCommit();
-    m_pending = false;
-
-    if (err != NOERROR)
+    if (!err)
+    {
+        apply_repair_iat_list(m_repair_iat);
+    }
+    else
     {
         LOG("<<< Unable to commit hooks (error %u).", err);
         free_repair_iat_list(m_repair_iat);
+        m_desc_count = 0;
         return false;
     }
 
-    repair_iat_list(m_repair_iat);
+    // Apply any IAT hooks.
+    int failed = 0;
+    for (int i = 0; i < m_desc_count; ++i)
+    {
+        const hook_iat_desc& desc = m_descs[i];
+        failed += !commit_iat(m_self, desc);
+    }
+    m_desc_count = 0;
+
+    if (failed)
+    {
+        LOG("<<< Unable to commit hooks.");
+        return false;
+    }
+
     LOG("<<< Hook transaction committed.");
 
     // TODO: resume threads?  Currently this relies on CMD being essentially
     // single threaded.
+
+    return true;
+}
+
+//------------------------------------------------------------------------------
+bool hook_setter::commit_iat(void* self, const hook_iat_desc& desc)
+{
+    hookptr_t addr = hook_iat(desc.base, nullptr, desc.name, desc.hook, 1);
+    if (addr == nullptr)
+    {
+        LOG("Unable to hook %s in IAT at base %p", desc.name, desc.base);
+        return false;
+    }
+
+    // If the target's IAT was hooked then the hook destination is now
+    // stored in 'addr'. We hook ourselves with this address to maintain
+    // any IAT hooks that may already exist.
+    if (hook_iat(self, nullptr, desc.name, addr, 1) == 0)
+    {
+        LOG("Failed to hook own IAT for %s", desc.name);
+        return false;
+    }
 
     return true;
 }

@@ -482,7 +482,7 @@ bool add_repair_iat_node(
     return true;
 }
 
-void repair_iat_list(repair_iat_node*& list)
+void apply_repair_iat_list(repair_iat_node*& list)
 {
     vm vm;
 

@@ -257,22 +257,15 @@ bool host_cmd::validate()
 }
 
 //------------------------------------------------------------------------------
-static PVOID Real_SetEnvironmentVariableW = &SetEnvironmentVariableW;
-static PVOID Real_GetEnvironmentVariableW = &GetEnvironmentVariableW;
-static PVOID Detour_GetEnvironmentVariableW = nullptr;
-BOOL (WINAPI* Real_WriteConsoleW)(HANDLE hConOut, const VOID* lpBuffer, DWORD nNumToWrite, LPDWORD lpNumWritten, LPVOID lpReserved) = &WriteConsoleW;
-BOOL (WINAPI* Real_ReadConsoleW)(HANDLE hConIn, LPVOID lpBuffer, DWORD nNumToRead, LPDWORD lpNumRead, PCONSOLE_READCONSOLE_CONTROL pInputControl) = &ReadConsoleW;
 bool host_cmd::initialise()
 {
-    assert(!Detour_GetEnvironmentVariableW);
-
     hook_setter hooks;
 
     // Hook the setting of the 'prompt' environment variable so we can tag
     // it and detect command entry via a write hook.
     tag_prompt();
-    hooks.attach(nullptr, &Real_SetEnvironmentVariableW, "SetEnvironmentVariableW", &host_cmd::set_env_var, true/*repair_iat*/);
-    hooks.attach(nullptr, &(PVOID&)Real_WriteConsoleW, "WriteConsoleW", &host_cmd::write_console, true/*repair_iat*/);
+    hooks.add_iat(nullptr, "SetEnvironmentVariableW", &host_cmd::set_env_var);
+    hooks.add_iat(nullptr, "WriteConsoleW", &host_cmd::write_console);
 
     // Set a trap to get a callback when cmd.exe fetches PROMPT environment
     // variable.  GetEnvironmentVariableW is always called before displaying the
@@ -282,19 +275,16 @@ bool host_cmd::initialise()
     {
         seh_scope seh;
 
-        hook_setter hooks;
-        hooks.detach(&Real_GetEnvironmentVariableW, "GetEnvironmentVariableW", Detour_GetEnvironmentVariableW);
-        hooks.commit();
-
         DWORD ret = GetEnvironmentVariableW(lpName, lpBuffer, nSize);
+
+        void* base = GetModuleHandle(nullptr);
+        hook_iat(base, nullptr, "GetEnvironmentVariableW", hookptr_t(GetEnvironmentVariableW), 1);
 
         host_cmd::get()->initialise_system();
         return ret;
     };
     auto* as_stdcall = static_cast<DWORD (__stdcall *)(LPCWSTR, LPWSTR, DWORD)>(get_environment_variable_w);
-    Detour_GetEnvironmentVariableW = hookptr_t(as_stdcall);
-    // Passes false for repair_iat so that detach() can be used!
-    hooks.attach(nullptr, &Real_GetEnvironmentVariableW, "GetEnvironmentVariableW", Detour_GetEnvironmentVariableW, false/*repair_iat*/);
+    hooks.add_iat(nullptr, "GetEnvironmentVariableW", as_stdcall);
 
     rl_add_funmap_entry("clink-expand-env-var", expand_env_var);
     rl_add_funmap_entry("clink-expand-doskey-alias", expand_doskey_alias);
@@ -414,7 +404,7 @@ BOOL WINAPI host_cmd::read_console(
 
     // if the input handle isn't a console handle then go the default route.
     if (GetFileType(input) != FILE_TYPE_CHAR)
-        return Real_ReadConsoleW(input, chars, max_chars, read_in, control);
+        return ReadConsoleW(input, chars, max_chars, read_in, control);
 
     // If cmd.exe is asking for one character at a time, use the original path
     // It does this to handle y/n/all prompts which isn't an compatible use-
@@ -425,7 +415,7 @@ BOOL WINAPI host_cmd::read_console(
     // Sometimes cmd.exe wants line input for reasons other than command entry.
     const wchar_t* prompt = host_cmd::get()->m_prompt.get();
     if (prompt == nullptr || *prompt == L'\0')
-        return Real_ReadConsoleW(input, chars, max_chars, read_in, control);
+        return ReadConsoleW(input, chars, max_chars, read_in, control);
 
     host_cmd::get()->edit_line(prompt, chars, max_chars);
 
@@ -452,7 +442,7 @@ BOOL WINAPI host_cmd::write_console(
 
     // if the output handle isn't a console handle then go the default route.
     if (GetFileType(output) != FILE_TYPE_CHAR)
-        return Real_WriteConsoleW(output, chars, to_write, written, unused);
+        return WriteConsoleW(output, chars, to_write, written, unused);
 
     if (host_cmd::get()->capture_prompt(chars, to_write))
     {
@@ -463,7 +453,7 @@ BOOL WINAPI host_cmd::write_console(
         return TRUE;
     }
 
-    return Real_WriteConsoleW(output, chars, to_write, written, unused);
+    return WriteConsoleW(output, chars, to_write, written, unused);
 }
 
 //------------------------------------------------------------------------------
@@ -492,11 +482,11 @@ BOOL WINAPI host_cmd::set_env_var(const wchar_t* name, const wchar_t* value)
 //------------------------------------------------------------------------------
 bool host_cmd::initialise_system()
 {
-    // Must hook the one in kernelbase.dll, not kernel32.dll.  CMD links
-    // directly with kernelbase.dll, but we link with kernel32.dll.  So hooking
-    // our ReadConsoleW pointer wouldn't affect CMD.
+    // Must hook the one in kernelbase.dll.  CMD links with kernelbase.dll, but
+    // we link with kernel32.dll.  So hooking our ReadConsoleW pointer wouldn't
+    // affect CMD.
     hook_setter hooks;
-    hooks.attach("kernelbase.dll", &(PVOID&)Real_ReadConsoleW, "ReadConsoleW", &host_cmd::read_console, true/*repair_iat*/);
+    hooks.add_jmp("kernelbase.dll", "ReadConsoleW", &host_cmd::read_console);
     if (!hooks.commit())
         return false;
 
