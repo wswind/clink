@@ -39,6 +39,12 @@ setting_bool g_terminal_raw_esc(
     "Changing this only affects future Clink sessions, not the current session.",
     false);
 
+setting_bool g_altf4_exits(
+    "cmd.altf4_exits",
+    "Pressing Alt-F4 exits session",
+    "When enabled (the default), pressing Alt-F4 exits cmd.exe.",
+    true);
+
 static setting_bool g_differentiate_keys(
     "terminal.differentiate_keys",
     "Use special sequences for Ctrl-H, -I, -M, -[",
@@ -62,6 +68,8 @@ extern setting_enum g_default_bindings;
 extern "C" void reset_wcwidths();
 extern "C" int is_locked_cursor();
 extern HANDLE get_recognizer_event();
+extern HANDLE get_task_manager_event();
+extern void task_manager_on_idle();
 extern void host_refresh_recognizer();
 
 //------------------------------------------------------------------------------
@@ -529,9 +537,16 @@ const char* find_key_name(const char* keyseq, int& len, int& eqclass, int& order
 //------------------------------------------------------------------------------
 enum : unsigned char
 {
+    // Currently, the first byte in UTF8 cannot have the high 5 bits all 1.
+    // That gives us room to define some magic characters:
+    //      0xff  0xfe  0xfd  0xfc  0xfb  0xfa  0xf9  0xf8
+    //
+    // Longer term, it's probably worth pushing valid UTF8 representations of
+    // invalid UTF8 codepoints, if that's possible.
+
     input_abort_byte    = 0xff,
     input_none_byte     = 0xfe,
-    input_timeout_byte  = 0xfd,
+    input_exit_byte     = 0xfd,
 };
 
 
@@ -549,6 +564,12 @@ unsigned int win_terminal_in::get_dimensions()
 
 
 //------------------------------------------------------------------------------
+win_terminal_in::win_terminal_in(bool cursor_visibility)
+: m_cursor_visibility(cursor_visibility)
+{
+}
+
+//------------------------------------------------------------------------------
 void win_terminal_in::begin()
 {
     if (!s_interrupt)
@@ -560,7 +581,8 @@ void win_terminal_in::begin()
     m_stdout = GetStdHandle(STD_OUTPUT_HANDLE);
     m_dimensions = get_dimensions();
     GetConsoleMode(m_stdin, &m_prev_mode);
-    show_cursor(false);
+    if (m_cursor_visibility)
+        show_cursor(false);
 
     m_prev_mouse_button_state = 0;
     if (GetKeyState(VK_LBUTTON) < 0)
@@ -572,10 +594,40 @@ void win_terminal_in::begin()
 //------------------------------------------------------------------------------
 void win_terminal_in::end()
 {
-    show_cursor(true);
+    if (m_cursor_visibility)
+        show_cursor(true);
     SetConsoleMode(m_stdin, m_prev_mode);
     m_stdin = nullptr;
     m_stdout = nullptr;
+}
+
+//------------------------------------------------------------------------------
+bool win_terminal_in::available(unsigned int _timeout)
+{
+    const DWORD stop = GetTickCount() + _timeout;
+    while (!m_buffer_count)
+    {
+        DWORD timeout = stop - GetTickCount();
+        if (timeout > _timeout)
+            timeout = 0;
+
+        // Read console input.  This is necessary to filter out OS events that
+        // Clink does not process as input.
+        read_console(nullptr, timeout, true/*peek*/);
+
+        // If real input is available, break out.
+        const unsigned char k = peek();
+        if (k != input_none_byte &&
+            k != input_exit_byte)
+            break;
+
+        // Eat the input.
+        read();
+
+        if (!timeout)
+            break;
+    }
+    return m_buffer_count > 0;
 }
 
 //------------------------------------------------------------------------------
@@ -602,8 +654,8 @@ int win_terminal_in::read()
     switch (c)
     {
     case input_none_byte:       return terminal_in::input_none;
-    case input_timeout_byte:    return terminal_in::input_timeout;
     case input_abort_byte:      return terminal_in::input_abort;
+    case input_exit_byte:       return terminal_in::input_exit;
     default:                    return c;
     }
 }
@@ -634,11 +686,12 @@ void win_terminal_in::fix_console_input_mode()
             LOG("CONSOLE MODE: console input is in ENABLE_PROCESSED_INPUT mode (0x%x)", modeIn);
 #endif
 
-        if (modeIn & ENABLE_MOUSE_INPUT)
-            console_config::fix_quick_edit_mode(modeIn);
+        mode = select_mouse_input(mode);
+        if (mode & ENABLE_MOUSE_INPUT)
+            console_config::fix_quick_edit_mode(mode);
 
         if (mode != modeIn)
-            SetConsoleMode(m_stdin, modeIn);
+            SetConsoleMode(m_stdin, mode);
     }
 }
 
@@ -656,21 +709,23 @@ static void fix_console_output_mode(HANDLE h, DWORD modeExpected)
 }
 
 //------------------------------------------------------------------------------
-void win_terminal_in::read_console(input_idle* callback)
+void win_terminal_in::read_console(input_idle* callback, DWORD _timeout, bool peek)
 {
     // Hide the cursor unless we're accepting input so we don't have to see it
     // jump around as the screen's drawn.
     struct cursor_scope {
-        cursor_scope()  { show_cursor(true); }
-        ~cursor_scope() { show_cursor(false); }
-    } _cs;
+        cursor_scope(bool doit) : m_doit(doit) { if (m_doit) show_cursor(true); }
+        ~cursor_scope() { if (m_doit) show_cursor(false); }
+    private:
+        const bool m_doit;
+    } _cs(m_cursor_visibility);
 
     // Conhost restarts the cursor blink when writing to the console. It restarts
     // hidden which means that if you type faster than the blink the cursor turns
     // invisible. Fortunately, moving the cursor restarts the blink on visible.
     CONSOLE_SCREEN_BUFFER_INFO csbi;
     GetConsoleScreenBufferInfo(m_stdout, &csbi);
-    if (!is_scroll_mode())
+    if (m_cursor_visibility && !is_scroll_mode())
         SetConsoleCursorPosition(m_stdout, csbi.dwCursorPosition);
 
     // Reset interrupt detection (allow Ctrl+Break to cancel input).
@@ -679,6 +734,7 @@ void win_terminal_in::read_console(input_idle* callback)
 
     // Read input records sent from the terminal (aka conhost) until some
     // input has been buffered.
+    const DWORD started = GetTickCount();
     const unsigned int buffer_count = m_buffer_count;
     while (buffer_count == m_buffer_count)
     {
@@ -690,8 +746,9 @@ void win_terminal_in::read_console(input_idle* callback)
         while (true)
         {
             unsigned count = 1;
-            HANDLE handles[4] = { m_stdin };
+            HANDLE handles[5] = { m_stdin };
             DWORD recognizer_waited = WAIT_FAILED;
+            DWORD task_manager_waited = WAIT_FAILED;
 
             if (s_interrupt)
                 handles[count++] = s_interrupt;
@@ -703,13 +760,30 @@ void win_terminal_in::read_console(input_idle* callback)
                     recognizer_waited = WAIT_OBJECT_0 + count;
                     handles[count++] = event;
                 }
+                if (void* event = get_task_manager_event())
+                {
+                    task_manager_waited = WAIT_OBJECT_0 + count;
+                    handles[count++] = event;
+                }
                 if (void* event = callback->get_waitevent())
                     handles[count++] = event;
             }
 
+            assert(count <= sizeof_array(handles));
+
             fix_console_input_mode();
 
-            const DWORD timeout = callback ? callback->get_timeout() : INFINITE;
+            DWORD timeout = callback ? callback->get_timeout() : INFINITE;
+            if (_timeout != INFINITE)
+            {
+                const DWORD now = GetTickCount();
+                const DWORD elapsed = now - started;
+                if (elapsed < _timeout)
+                    timeout = _timeout - elapsed;
+                else
+                    timeout = 0;
+            }
+
             const DWORD waited = WaitForMultipleObjects(count, handles, false, timeout);
             if (waited != WAIT_TIMEOUT)
             {
@@ -728,12 +802,17 @@ void win_terminal_in::read_console(input_idle* callback)
             {
                 if (waited == recognizer_waited)
                     host_refresh_recognizer();
+                else if (waited == task_manager_waited)
+                    callback->on_task_manager();
                 else
                     callback->on_idle();
             }
 
             if (has_mode)
                 fix_console_output_mode(m_stdout, modeExpected);
+
+            if (!callback && waited == WAIT_TIMEOUT)
+                return;
         }
 
         if (has_mode)
@@ -741,7 +820,9 @@ void win_terminal_in::read_console(input_idle* callback)
 
         DWORD count;
         INPUT_RECORD record;
-        if (!ReadConsoleInputW(m_stdin, &record, 1, &count))
+        if (!(peek ?
+              PeekConsoleInputW(m_stdin, &record, 1, &count) :
+              ReadConsoleInputW(m_stdin, &record, 1, &count)))
         {
             // Handle's probably invalid if ReadConsoleInput() failed.
             m_buffer_head = 0;
@@ -750,6 +831,7 @@ void win_terminal_in::read_console(input_idle* callback)
             return;
         }
 
+        bool ret = false;
         switch (record.EventType)
         {
         case KEY_EVENT:
@@ -771,11 +853,19 @@ void win_terminal_in::read_console(input_idle* callback)
                 CONSOLE_SCREEN_BUFFER_INFO csbiNew;
                 GetConsoleScreenBufferInfo(m_stdout, &csbiNew);
                 if (csbi.dwSize.X != csbiNew.dwSize.X)
-                    return;
-                csbi = csbiNew; // Update for next time.
+                    ret = true;
+                else
+                    csbi = csbiNew; // Update for next time.
             }
             break;
         }
+
+        // Eat records that don't result in available input.
+        if (peek && buffer_count == m_buffer_count)
+            ReadConsoleInputW(m_stdin, &record, 1, &count);
+
+        if (ret)
+            return;
     }
 }
 
@@ -855,6 +945,44 @@ static void verbose_input(KEY_EVENT_RECORD const& record)
             key_name,
             dead,
             epi);
+}
+
+//------------------------------------------------------------------------------
+// Try to handle Alt-Ctrl-[, Alt-Ctrl-], Alt-Ctrl-\ better, at least in keyboard
+// layouts where the [, ], or \ is the regular (unshifted) name of the key.
+static bool translate_ctrl_bracket(int& key_vk, int key_sc)
+{
+    char buf[32];
+    buf[0] = 0;
+    str_base tmps(buf);
+
+    // Can't realistically apply caching here, because software keyboard layouts
+    // can be changed dynamically.
+    const char* key_name = key_name_from_vk(key_vk, tmps, key_sc) ? buf : "UNKNOWN";
+
+    if (key_name[1])
+        return false;
+
+    switch (key_name[0])
+    {
+    case '[':
+        if (!g_terminal_raw_esc.get())
+        {
+            // Must avoid this because it would produce "\e\e" which is the
+            // prefix for some Fn keys (e.g. Alt-F4 is "\e\eOS").  But raw Esc
+            // mode explicitly requests that behavior.
+            return false;
+        }
+        break;
+    case ']':
+    case '\\':
+        break;
+    default:
+        return false;
+    }
+
+    key_vk = key_name[0] - '@';
+    return true;
 }
 
 //------------------------------------------------------------------------------
@@ -956,6 +1084,13 @@ void win_terminal_in::process_input(KEY_EVENT_RECORD const& record)
     if (key_func <= (VK_F12 - VK_F1))
     {
         int kfx_group = terminfo::keymod_index(key_flags);
+        if (kfx_group == 4 && key_func == 3 && g_altf4_exits.get())
+        {
+            m_buffer_head = 0;
+            m_buffer_count = 1;
+            m_buffer[0] = input_exit_byte;
+            return;
+        }
         push((terminfo::kfx + (12 * kfx_group) + key_func)[0]);
         return;
     }
@@ -1076,7 +1211,8 @@ void win_terminal_in::process_input(KEY_EVENT_RECORD const& record)
                     break;
                 default:
 not_ctrl:
-                    ctrl_code = false;
+                    if (!translate_ctrl_bracket(key_vk, key_sc))
+                        ctrl_code = false;
                     break;
                 }
                 break;
@@ -1199,7 +1335,7 @@ void win_terminal_in::process_input(MOUSE_EVENT_RECORD const& record)
         const char code = (drag ? 'M' :
                            right_click ? 'R' :
                            record.dwEventFlags & DOUBLE_CLICK ? 'D' : 'L');
-        tmp.format("\x1b[$%u;%u%c", record.dwMousePosition.X - csbi.srWindow.Left, record.dwMousePosition.Y - csbi.srWindow.Top, code);
+        tmp.format("\x1b[$%u;%u%c", record.dwMousePosition.X, record.dwMousePosition.Y, code);
         push(tmp.c_str());
         return;
     }
@@ -1365,4 +1501,13 @@ unsigned char win_terminal_in::pop()
     m_buffer_head = (m_buffer_head + 1) & (sizeof_array(m_buffer) - 1);
 
     return value;
+}
+
+//------------------------------------------------------------------------------
+unsigned char win_terminal_in::peek()
+{
+    if (!m_buffer_count)
+        return input_none_byte;
+
+    return m_buffer[m_buffer_head];
 }

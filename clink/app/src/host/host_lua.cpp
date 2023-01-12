@@ -24,6 +24,7 @@ extern "C" {
 //------------------------------------------------------------------------------
 extern bool is_force_reload_scripts();
 extern void clear_force_reload_scripts();
+extern void clear_macro_descriptions();
 
 //------------------------------------------------------------------------------
 host_lua::host_lua()
@@ -31,6 +32,8 @@ host_lua::host_lua()
 , m_classifier(m_state)
 , m_idle(m_state)
 {
+    clear_macro_descriptions();
+
     str<280> bin_path;
     app_context::get()->get_binaries_dir(bin_path);
 
@@ -69,11 +72,26 @@ host_lua::operator input_idle* ()
 //------------------------------------------------------------------------------
 void host_lua::load_scripts()
 {
+    // Load scripts.
     str<280> script_path;
     app_context::get()->get_script_path(script_path);
     load_scripts(script_path.c_str());
     m_prev_script_path = script_path.c_str();
     clear_force_reload_scripts();
+
+    // Set the script paths so argmatchers can be loaded from completion dirs.
+    {
+        lua_State* state = m_state.get_state();
+        save_stack_top ss(state);
+
+        lua_getglobal(state, "clink");
+        lua_pushliteral(state, "_set_completion_dirs");
+        lua_rawget(state, -2);
+
+        lua_pushlstring(state, script_path.c_str(), script_path.length());
+
+        m_state.pcall(1, 0);
+    }
 }
 
 //------------------------------------------------------------------------------
@@ -118,10 +136,12 @@ bool host_lua::load_scripts(const char* paths)
             }
         }
 
-        // Load a given directory only once.
-        tmp = token.c_str();
+        // Expand and normalize the directory.
+        path::tilde_expand(token.c_str(), tmp);
         path::normalise(tmp);
         path::maybe_strip_last_separator(tmp);
+
+        // Load a given directory only once.
         transform = tmp.c_str();
         str_transform(transform.c_str(), transform.length(), out, transform_mode::lower);
         if (seen.find(out.c_str()) != seen.end())
@@ -129,7 +149,7 @@ bool host_lua::load_scripts(const char* paths)
         seen.emplace(out.c_str());
         seen_strings.emplace_back(std::move(out));
 
-        load_script(token.c_str(), num_loaded, num_failed);
+        load_script(tmp.c_str(), num_loaded, num_failed);
     }
 
     if (num_failed)
@@ -210,9 +230,9 @@ bool host_lua::call_lua_rl_global_function(const char* func_name, line_state* li
 }
 
 //------------------------------------------------------------------------------
-void host_lua::call_lua_filter_matches(char** matches, int completion_type, int filename_completion_desired)
+bool host_lua::call_lua_filter_matches(char** matches, int completion_type, int filename_completion_desired)
 {
-    m_generator.filter_matches(matches, char(completion_type), !!filename_completion_desired);
+    return m_generator.filter_matches(matches, char(completion_type), !!filename_completion_desired);
 }
 
 //------------------------------------------------------------------------------

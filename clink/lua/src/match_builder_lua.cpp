@@ -19,11 +19,13 @@ const match_builder_lua::method match_builder_lua::c_methods[] = {
     { "setsuppressappend",  &set_suppress_append },
     { "setsuppressquoting", &set_suppress_quoting },
     { "setnosort",          &set_no_sort },
+    { "setvolatile",        &set_volatile },
     // Only for backward compatibility:
     { "deprecated_addmatch", &deprecated_add_match },
     { "setmatchesarefiles", &set_matches_are_files },
     // UNDOCUMENTED; internal use only.
     { "clear_toolkit",      &clear_toolkit },
+    { "matches_ready",      &matches_ready },
     {}
 };
 
@@ -93,7 +95,7 @@ match_builder_lua::~match_builder_lua()
 /// <tr><th>Type</th><th>Description</th></tr>
 /// <tr><td>"word"</td><td>Shows the whole word even if it contains slashes.</td></tr>
 /// <tr><td>"arg"</td><td>Avoids appending a space if the match ends with a colon or equal sign.</td></tr>
-/// <tr><td>"command"</td><td>Displays the match using <a href="#color_cmd">color.cmd</a>.</td></tr>
+/// <tr><td>"cmd"</td><td>Displays the match using <a href="#color_cmd">color.cmd</a>.</td></tr>
 /// <tr><td>"alias"</td><td>Displays the match using <a href="#color_doskey">color.doskey</a>.</td></tr>
 /// <tr><td>"file"</td><td>Shows only the last path component, with appropriate file coloring.</td></tr>
 /// <tr><td>"dir"</td><td>Shows only the last path component and adds a trailing path separator, with appropriate directory coloring.</td></tr>
@@ -217,6 +219,31 @@ int match_builder_lua::set_no_sort(lua_State* state)
 }
 
 //------------------------------------------------------------------------------
+/// -name:  builder:setvolatile
+/// -ver:   1.3.37
+/// Forces the generated matches to be used only once.
+///
+/// Normally Clink tries to reuse the most recently generated list of matches,
+/// if possible.  It is an optimization, to avoid doing potentally expensive
+/// work multiple times in a row to generate the same list of matches when
+/// nothing has changed.  Normally the optimization is beneficial, and typing
+/// more letters in a word can simply filter the existing list of matches.
+///
+/// But sometimes an argument may have special syntax.  For example, an email
+/// address argument might want to generate matches for names until the word
+/// contains a <code>@</code>, and then it might want to generate matches for
+/// domain names.  The optimization interferes with situations where parsing the
+/// word produces a completely different list of possible matches.
+///
+/// Making the generated matches volatile ensures matches are generated anew
+/// each time completion is invoked.
+int match_builder_lua::set_volatile(lua_State* state)
+{
+    m_builder->set_volatile();
+    return 0;
+}
+
+//------------------------------------------------------------------------------
 // Undocumented because it exists only to enable the clink.add_match backward
 // compatibility.
 int match_builder_lua::deprecated_add_match(lua_State* state)
@@ -246,6 +273,23 @@ int match_builder_lua::clear_toolkit(lua_State* state)
     if (m_toolkit)
         m_toolkit->clear();
     return 0;
+}
+
+//------------------------------------------------------------------------------
+// UNDOCUMENTED; internal use only.
+int match_builder_lua::matches_ready(lua_State* state)
+{
+    if (!m_toolkit)
+        return 0;
+
+    bool isnum;
+    int id = checkinteger(state, 1, &isnum);
+    if (!isnum)
+        return 0;
+
+    extern bool notify_matches_ready(std::shared_ptr<match_builder_toolkit> toolkit, int generation_id);
+    lua_pushboolean(state, notify_matches_ready(m_toolkit, id));
+    return 1;
 }
 
 //------------------------------------------------------------------------------

@@ -3,7 +3,6 @@
 
 #include "pch.h"
 #include "history_db.h"
-#include "utils/app_context.h"
 
 #include <core/base.h>
 #include <core/globber.h>
@@ -86,6 +85,8 @@ static setting_bool g_sticky_search(
     "many times, Enter, Down, Enter, Down, Enter, etc).",
     false);
 
+extern setting_enum g_history_timestamp;
+
 static constexpr int c_max_max_history_lines = 999999;
 static int get_max_history()
 {
@@ -128,22 +129,6 @@ static int history_expand_control(char* line, int marker_pos)
     }
 
     return 0;
-}
-
-//------------------------------------------------------------------------------
-static void get_file_path(str_base& out, bool session)
-{
-    out.clear();
-
-    const auto* app = app_context::get();
-    app->get_history_path(out);
-
-    if (session)
-    {
-        str<16> suffix;
-        suffix.format("_%d", app->get_id());
-        out << suffix;
-    }
 }
 
 //------------------------------------------------------------------------------
@@ -359,7 +344,7 @@ public:
         template <int S>    line_iter(const read_lock& lock, char (&buffer)[S]);
         template <int S>    line_iter(void* handle, char (&buffer)[S]);
                             ~line_iter() = default;
-        line_id_impl        next(str_iter& out);
+        line_id_impl        next(str_iter& out, str_base* timestamp=nullptr);
         void                set_file_offset(unsigned int offset);
         unsigned int        get_deleted_count() const { return m_deleted; }
 
@@ -484,7 +469,8 @@ template <typename T> int read_lock::for_each_removal(const read_lock& target, T
 #ifdef DEBUG
         {
             char sz[MAX_PATH];
-            GetFinalPathNameByHandle(verify_handles.m_handle_lines, sz, sizeof_array(sz), 0);
+            DWORD path_len = GetFinalPathNameByHandle(verify_handles.m_handle_lines, sz, sizeof_array(sz), 0);
+            assert(path_len);
             const char* name = path::get_name(sz);
             const int is_master_history = (strnicmp(name, "clink_history", 13) == 0 && name[13] != '_');
             if (!is_master_history)
@@ -658,8 +644,10 @@ inline bool is_line_breaker(unsigned char c)
 }
 
 //------------------------------------------------------------------------------
-line_id_impl read_lock::line_iter::next(str_iter& out)
+line_id_impl read_lock::line_iter::next(str_iter& out, str_base* timestamp)
 {
+    if (timestamp)
+        timestamp->clear();
     while (m_remaining || provision())
     {
         const char* last = m_file_iter.get_buffer() + m_file_iter.get_buffer_size();
@@ -713,6 +701,25 @@ line_id_impl read_lock::line_iter::next(str_iter& out)
         const bool too_big = (real_offset >= c_max_line_id.offset);
         assert(!too_big);
         const unsigned int offset = too_big ? c_max_line_id.offset : static_cast<unsigned int>(real_offset);
+
+        // Timestamps precede the line they're associated with, so that the
+        // iterator can easily determine whether there's a timestamp and return
+        // both the line and the timestamp in a single call.
+        if (*start == '|')
+        {
+            if (strncmp(start, "|\ttime=", 7) == 0)
+            {
+                if (timestamp)
+                {
+                    start += 7;
+                    timestamp->clear();
+                    timestamp->concat(start, int(end - start));
+                }
+                continue;
+            }
+            if (timestamp)
+                timestamp->clear();
+        }
 
         // Removals from master are deferred when `history.shared` is false, so
         // also test for deferred removals here.
@@ -821,7 +828,7 @@ class read_line_iter
 {
 public:
                             read_line_iter(const history_db& db, unsigned int this_size);
-    history_db::line_id     next(str_iter& out);
+    history_db::line_id     next(str_iter& out, str_base* timestamp=nullptr);
     unsigned int            get_bank() const { return m_bank_index; }
 
 private:
@@ -862,14 +869,14 @@ bool read_line_iter::next_bank()
 }
 
 //------------------------------------------------------------------------------
-history_db::line_id read_line_iter::next(str_iter& out)
+history_db::line_id read_line_iter::next(str_iter& out, str_base* timestamp)
 {
     if (m_bank_index > sizeof_array(m_db.m_bank_handles))
         return 0;
 
     do
     {
-        if (line_id_impl ret = m_line_iter.next(out))
+        if (line_id_impl ret = m_line_iter.next(out, timestamp))
         {
             ret.bank_index = m_bank_index - 1;
             return ret.outer;
@@ -897,9 +904,9 @@ history_db::iter::~iter()
 }
 
 //------------------------------------------------------------------------------
-history_db::line_id history_db::iter::next(str_iter& out)
+history_db::line_id history_db::iter::next(str_iter& out, str_base* timestamp)
 {
-    return impl ? ((read_line_iter*)impl)->next(out) : 0;
+    return impl ? ((read_line_iter*)impl)->next(out, timestamp) : 0;
 }
 
 //------------------------------------------------------------------------------
@@ -1099,12 +1106,24 @@ static void migrate_history(const char* path, bool m_diagnostic)
 
 
 //------------------------------------------------------------------------------
-history_db::history_db(bool use_master_bank)
-: m_use_master_bank(use_master_bank)
+history_db::history_db(const char* path, int id, bool use_master_bank)
+: m_path(path)
+, m_id(id)
+, m_use_master_bank(use_master_bank)
 {
+    static_assert(sizeof(line_id) == sizeof(line_id_impl), "");
+
     memset(m_bank_handles, 0, sizeof(m_bank_handles));
     m_master_len = 0;
     m_master_deleted_count = 0;
+
+    history_inhibit_expansion_function = history_expand_control;
+
+    if (path::is_device(m_path.c_str()))
+    {
+        m_path.clear();
+        return;
+    }
 
     // Remember the bank file names so they are stable for the lifetime of this
     // history_db.  Otherwise changing %CLINK_HISTORY_LABEL% can change the file
@@ -1115,24 +1134,21 @@ history_db::history_db(bool use_master_bank)
     get_file_path(m_bank_filenames[bank_session], true);
 
     // Create a self-deleting file to used to indicate this session's alive
-    str<280> path(m_bank_filenames[bank_session].c_str());
-    path << "~";
+    str<280> alive(m_bank_filenames[bank_session].c_str());
+    alive << "~";
 
-    wstr<> wpath(path.c_str());
+    wstr<> walive(alive.c_str());
     DWORD flags = FILE_FLAG_DELETE_ON_CLOSE|FILE_ATTRIBUTE_HIDDEN;
-    m_alive_file = CreateFileW(wpath.c_str(), 0, 0, nullptr, CREATE_ALWAYS, flags, nullptr);
+    m_alive_file = CreateFileW(walive.c_str(), 0, 0, nullptr, CREATE_ALWAYS, flags, nullptr);
     m_alive_file = (m_alive_file == INVALID_HANDLE_VALUE) ? nullptr : m_alive_file;
-
-    history_inhibit_expansion_function = history_expand_control;
-
-    static_assert(sizeof(line_id) == sizeof(line_id_impl), "");
 }
 
 //------------------------------------------------------------------------------
 history_db::~history_db()
 {
     // Close alive handle
-    CloseHandle(m_alive_file);
+    if (m_alive_file)
+        CloseHandle(m_alive_file);
 
     // Close all but the master bank. We're going to append to the master one.
     for (int i = 1; i < sizeof_array(m_bank_handles); ++i)
@@ -1146,6 +1162,9 @@ history_db::~history_db()
 //------------------------------------------------------------------------------
 void history_db::reap()
 {
+    if (!is_valid())
+        return;
+
     dbg_ignore_scope(snapshot, "History");
 
     str<280> removals;
@@ -1207,7 +1226,7 @@ void history_db::reap()
 //------------------------------------------------------------------------------
 void history_db::initialise(str_base* error_message)
 {
-    if (m_bank_handles[bank_master])
+    if (m_bank_handles[bank_master] || m_bank_handles[bank_session] || !is_valid())
         return;
 
     str<280> path;
@@ -1294,7 +1313,7 @@ bank_handles history_db::get_bank(unsigned int index) const
     //   - EXCEPT in apply_removals(), but the caller adjusts that case.
     // Writing session needs session lines.
     bank_handles handles;
-    if (index < sizeof_array(m_bank_handles))
+    if (index < sizeof_array(m_bank_handles) && is_valid())
     {
         handles.m_handle_lines = m_bank_handles[index].m_handle_lines;
         if (index == bank_master)
@@ -1328,6 +1347,8 @@ template <typename T> void history_db::for_each_bank(T&& callback) const
 //------------------------------------------------------------------------------
 template <typename T> void history_db::for_each_session(T&& callback) const
 {
+    assert(is_valid());
+
     // Fold each session found that has no valid alive file.
     str<280> path;
     path << m_bank_filenames[bank_master] << "_*";
@@ -1342,6 +1363,25 @@ template <typename T> void history_db::for_each_session(T&& callback) const
             continue;
 
         callback(path, local);
+    }
+}
+
+//------------------------------------------------------------------------------
+bool history_db::is_valid() const
+{
+    return !m_path.empty();
+}
+
+//------------------------------------------------------------------------------
+void history_db::get_file_path(str_base& out, bool session) const
+{
+    out = m_path.c_str();
+
+    if (session && is_valid())
+    {
+        str<16> suffix;
+        suffix.format("_%d", m_id);
+        out << suffix;
     }
 }
 
@@ -1375,14 +1415,17 @@ void history_db::load_internal()
         dbg_snapshot_heap(snapshot);
 
         str_iter out;
+        str<32> time;
         line_id_impl id;
         unsigned int num_lines = 0;
-        while (id = iter.next(out))
+        while (id = iter.next(out, &time))
         {
             const char* line = out.get_pointer();
             int buffer_offset = int(line - buffer.data());
             buffer.data()[buffer_offset + out.length()] = '\0';
             add_history(line);
+            if (!time.empty())
+                add_history_time(time.c_str());
 
             num_lines++;
 
@@ -1411,6 +1454,9 @@ void history_db::load_internal()
 //------------------------------------------------------------------------------
 void history_db::load_rl_history(bool can_clean)
 {
+    if (!is_valid())
+        return;
+
     load_internal();
 
     // The `clink history` command needs to be able to avoid cleaning the master
@@ -1425,6 +1471,9 @@ void history_db::load_rl_history(bool can_clean)
 //------------------------------------------------------------------------------
 void history_db::clear()
 {
+    if (!is_valid())
+        return;
+
     DIAG("... clearing history\n");
 
     for_each_bank([&] (unsigned int bank_index, write_lock& lock)
@@ -1449,6 +1498,9 @@ void history_db::clear()
 //------------------------------------------------------------------------------
 void history_db::compact(bool force, bool uniq, int _limit)
 {
+    if (!is_valid())
+        return;
+
     if (!m_use_master_bank)
     {
         assert(false);
@@ -1649,6 +1701,14 @@ bool history_db::add(const char* line)
     if (!lock)
         return false;
 
+    if (g_history_timestamp.get() > 0)
+    {
+        str<32> timestamp;
+        const time_t now = time(0);
+        timestamp.format("|\ttime=%u", now);
+        lock.add(timestamp.c_str());
+    }
+
     lock.add(line);
     return true;
 }
@@ -1768,8 +1828,14 @@ void history_db::make_open_error(str_base* error_message, unsigned char bank) co
 //------------------------------------------------------------------------------
 bool history_db::remove(int rl_history_index, const char* /*line*/)
 {
-    if (rl_history_index < 0 || size_t(rl_history_index) >= m_index_map.size())
+    if (rl_history_index < 0)
         return false;
+
+    if (size_t(rl_history_index) >= m_index_map.size())
+    {
+        // It may be an in-memory-only entry, so allow Readline to remove it.
+        return true;
+    }
 
     return remove(m_index_map[rl_history_index]);
 }
@@ -1823,9 +1889,20 @@ bool history_db::has_bank(unsigned char bank) const
 //------------------------------------------------------------------------------
 bool history_db::is_stale_name() const
 {
+    if (!is_valid())
+        return false;
+
     str<280> path;
     get_file_path(path, false);
     return !path.equals(m_bank_filenames[bank_master].c_str());
+}
+
+
+
+//------------------------------------------------------------------------------
+history_database::history_database(const char* path, int id, bool use_master_bank)
+: history_db(path, id, use_master_bank)
+{
 }
 
 

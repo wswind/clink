@@ -190,6 +190,7 @@ public:
     virtual int             get_suppress_quoting() const = 0;
     virtual int             get_word_break_position() const = 0;
     virtual bool            match_display_filter(const char* needle, char** matches, match_display_filter_entry*** filtered_matches, display_filter_flags flags, bool* old_filtering=nullptr) const = 0;
+    virtual bool            filter_matches(char** matches, char completion_type, bool filename_completion_desired) const = 0;
 
 private:
     friend class matches_iter;
@@ -205,9 +206,10 @@ private:
 
 
 //------------------------------------------------------------------------------
-match_type to_match_type(int mode, int attr, const char* path);
+match_type to_match_type(DWORD attr, const char* path, bool symlink=false);
 match_type to_match_type(const char* type_name);
 void match_type_to_string(match_type type, str_base& out);
+bool compare_matches(const char* l, match_type l_type, const char* r, match_type r_type);
 
 //------------------------------------------------------------------------------
 struct match_desc
@@ -235,6 +237,7 @@ public:
     void                    set_suppress_append(bool suppress=true);
     void                    set_suppress_quoting(int suppress=1); //0=no, 1=yes, 2=suppress end quote
     void                    set_no_sort();
+    void                    set_volatile();
 
     void                    set_deprecated_mode();
     void                    set_matches_are_files(bool files=true);

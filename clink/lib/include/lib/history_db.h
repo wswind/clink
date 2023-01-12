@@ -4,6 +4,7 @@
 #pragma once
 
 #include <core/str_iter.h>
+#include <core/singleton.h>
 
 #include <vector>
 
@@ -103,7 +104,7 @@ public:
     public:
                                 iter(iter&& other);
                                 ~iter();
-        line_id                 next(str_iter& out);
+        line_id                 next(str_iter& out, str_base* timestamp=nullptr);
         unsigned int            get_bank() const;
 
     private:
@@ -112,7 +113,7 @@ public:
         uintptr_t               impl = 0;
     };
 
-                                history_db(bool use_master_bank);
+                                history_db(const char* path, int id, bool use_master_bank);
                                 ~history_db();
     void                        initialise(str_base* error_message=nullptr);
     void                        load_rl_history(bool can_clean=true);
@@ -134,6 +135,8 @@ public:
 
 private:
     friend                      class read_line_iter;
+    bool                        is_valid() const;
+    void                        get_file_path(str_base& out, bool session) const;
     void                        load_internal();
     void                        reap();
     template <typename T> void  for_each_bank(T&& callback);
@@ -143,7 +146,9 @@ private:
     bank_handles                get_bank(unsigned int index) const;
     bool                        remove_internal(line_id id, bool guard_ctag);
     void                        make_open_error(str_base* error_message, unsigned char bank) const;
-    void*                       m_alive_file;
+    void*                       m_alive_file = nullptr;
+    str_moveable                m_path;
+    int                         m_id;
     bank_handles                m_bank_handles[bank_count];
     str<32>                     m_bank_filenames[bank_count];
     DWORD                       m_bank_error[bank_count];
@@ -163,5 +168,12 @@ template <int S> history_db::iter history_db::read_lines(char (&buffer)[S])
 {
     return read_lines(buffer, S);
 }
+
+//------------------------------------------------------------------------------
+class history_database : public history_db, public singleton<history_database>
+{
+public:
+    history_database(const char* path, int id, bool use_master_bank);
+};
 
 #define DIAG(fmt, ...)          do { if (m_diagnostic) fprintf(stderr, fmt, ##__VA_ARGS__); } while (false)

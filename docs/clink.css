@@ -11,6 +11,44 @@ body {
     margin: 0 auto;
 }
 
+.wlink {
+    opacity: 0%;
+    width: 100px;
+    position: absolute;
+    left: -24px;
+}
+
+.wfix {
+    visibility: hidden;
+    width: 0;
+}
+
+.wlink:hover {
+    opacity: 100%;
+}
+
+/*
+.wlink a {
+    color: inherit;
+}
+
+.wlink a:link {
+    color: inherit;
+}
+
+.wlink a:visited {
+    color: inherit;
+}
+
+.wlink a:hover {
+    color: inherit;
+}
+
+.wlink a:active {
+    color: inherit;
+}
+*/
+
 h1, h2, h3, h4, h5, h6, dt { font-family: Rambla,Roboto,Calibri,Arial,Helvetica,sans-serif }
 
 h1 {
@@ -29,6 +67,17 @@ h3 { font-size: 1.60rem; }
 h4 { font-size: 1.35rem; }
 h5 { font-size: 1.10rem; }
 h6 { font-size: 1.00rem; }
+
+h1, h2, h3, h4, h5, h6 {
+    position: relative;
+}
+
+h1:hover .wlink { opacity: 100% }
+h2:hover .wlink { opacity: 100% }
+h3:hover .wlink { opacity: 100% }
+h4:hover .wlink { opacity: 100% }
+h5:hover .wlink { opacity: 100% }
+h6:hover .wlink { opacity: 100% }
 
 dt {
     font-family: Rambla,Roboto,Calibri,Arial,Helvetica,sans-serif;
@@ -110,11 +159,11 @@ kbd {
     white-space:nowrap;
 }
 
-#content td:nth-child(1):not(.lmtd) {
+#content table:not(.linkmenu) td:nth-child(1) {
     white-space: nowrap;
 }
 
-#content td:nth-child(1):not(.lmtd) code {
+#content table:not(.linkmenu) td:nth-child(1) code {
     border: none;
     padding: 0 0 0 0;
     border-radius: 0;
@@ -127,8 +176,11 @@ kbd {
     margin-left: 2rem;
 }
 
-.lmtd {
-    padding-right: 1rem;
+.console {
+    border: none;
+    background-color: transparent;
+    margin-left: 0;
+    width: 100%;
 }
 
 .section {
@@ -165,7 +217,7 @@ kbd {
     clear: both;
 }
 
-#content table:not(.linkmenu) {
+#content table:not(.linkmenu,.console) {
     font-size: 1rem;
     margin: auto 5%;
     border-collapse: collapse;
@@ -177,7 +229,7 @@ kbd {
     background-color: #eee;
 }
 
-#content td:not(.lmtd), #content th {
+#content table:not(.linkmenu) td, #content th {
     vertical-align: text-top;
     padding: 0.2rem 0.5rem;
 }
@@ -186,16 +238,20 @@ kbd {
     background-color: #fff;
 }
 
-#content td:not(.lmtd) {
+#content table:not(.linkmenu,.console) td {
     border: 1px solid #ddd;
 }
 
-#content tr:nth-child(odd):not(.lmtr) {
+#content table:not(.linkmenu,.console) tr:nth-child(odd) {
     background-color: #fbfbfb;
 }
 
-#content tr:nth-child(even):not(.lmtr) {
+#content table:not(.linkmenu,.console) tr:nth-child(even) {
     background-color: #fff;
+}
+
+#content table.linkmenu td {
+    padding-right: 1rem;
 }
 
 #content hr {
@@ -240,7 +296,7 @@ kbd {
 }
 
 #content #api .body {
-    margin-left: 1rem;
+    margin-left: 3rem;
     margin-top: -0.5rem;
 }
 
@@ -248,6 +304,11 @@ kbd {
     font-weight: bold;
     float: left;
     width: 40%;
+    position: relative;
+}
+
+#content #api .header .name:hover .wlink {
+    opacity: 100%;
 }
 
 #content #api .header .signature {

@@ -26,11 +26,13 @@ public:
     int             set_suppress_append(lua_State* state);
     int             set_suppress_quoting(lua_State* state);
     int             set_no_sort(lua_State* state);
+    int             set_volatile(lua_State* state);
 
     int             deprecated_add_match(lua_State* state);
     int             set_matches_are_files(lua_State* state);
 
     int             clear_toolkit(lua_State* state);
+    int             matches_ready(lua_State* state);
 
 private:
     bool            add_match_impl(lua_State* state, int stack_index, match_type type);

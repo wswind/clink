@@ -33,23 +33,21 @@ clink.match_display_filter = nil
 
 
 --------------------------------------------------------------------------------
-local function advance_ignore_quotes(state)
-    local word = state[1]
-    local seek = #word
-    if seek > 0 then
+local function advance_ignore_quotes(word, seek)
+    if seek > 1 then
+        seek = seek - 1
         while true do
             -- Finding a non-quote is success.
-            if word:sub(seek, 1) ~= '"' then
-                state[1] = word:sub(1, seek - 1)
-                return true
+            if word:sub(seek, seek) ~= '"' then
+                return true, seek
             end
             -- Reaching the beginning is failure.
             if seek <= 1 then
                 break
             end
-            seek = seek -1
+            seek = seek - 1
             -- Finding a `\"` digraph is a failure.
-            if word:sub(seek, 1) == "\\" then
+            if word:sub(seek, seek) == "\\" then
                 break
             end
         end
@@ -59,22 +57,28 @@ end
 
 --------------------------------------------------------------------------------
 local function is_dots(word)
-    local state = { word }
+    local len = #word + 1
+    local ok
 
-    if not advance_ignore_quotes(state) then
+    ok, len = advance_ignore_quotes(word, len)
+    if not ok then
         return false            -- Too short.
-    elseif state[1]:sub(-1) ~= "." then
+    elseif word:sub(len, len) ~= "." then
         return false            -- No dot at end.
     end
 
-    if not advance_ignore_quotes(state) then
+    ok, len = advance_ignore_quotes(word, len)
+    if not ok then
         return true             -- Exactly ".".
-    elseif state[1]:sub(-1) == "." and not advance_ignore_quotes(state) then
-        return true             -- Exactly "..".
+    elseif word:sub(len, len) == "." then
+        ok, len = advance_ignore_quotes(word, len)
+        if not ok then
+            return true         -- Exactly "..".
+        end
     end
 
-    local last = state[1]:sub(-1)
-    if last == "/" or last == "\\" then
+    local sep = word:sub(len, len)
+    if sep == "/" or sep == "\\" then
         return true             -- Ends with "\." or "\..".
     end
 
@@ -82,7 +86,7 @@ local function is_dots(word)
 end
 
 --------------------------------------------------------------------------------
-function file_match_generator:generate(line_state, match_builder)
+function file_match_generator:generate(line_state, match_builder) -- luacheck: no self
     local root = line_state:getendword()
     if root == "~" then
         root = path.join(root, "")
@@ -92,12 +96,12 @@ function file_match_generator:generate(line_state, match_builder)
 end
 
 --------------------------------------------------------------------------------
-function file_match_generator:getwordbreakinfo(line_state)
+function file_match_generator:getwordbreakinfo(line_state) -- luacheck: no self
     local endword = line_state:getendword()
     local keep = #endword
-    if endword == "~" then
+    if endword == "~" then -- luacheck: ignore 542
         -- Tilde by itself should be expanded, so keep the whole word.
-    elseif is_dots(endword) then
+    elseif is_dots(endword) then -- luacheck: ignore 542
         -- `.` or `..` should be kept so that matches can include `.` or
         -- `..` directories.  Bash includes `.` and `..` but only when those
         -- match typed text (i.e. when there's no input text, they are not
@@ -130,7 +134,7 @@ local function cancel_match_generate_coroutine()
 end
 
 --------------------------------------------------------------------------------
-function clink._make_match_generate_coroutine(line, lines, matches, builder, generation_id)
+function clink._make_match_generate_coroutine(line, lines, matches, builder, generation_id) -- luacheck: no unused
     -- Bail if there's already a match generator coroutine running.
     if _match_generate_state.coroutine then
         return
@@ -158,7 +162,7 @@ function clink._make_match_generate_coroutine(line, lines, matches, builder, gen
         if not clink._is_coroutine_canceled(c) then
             -- PERF: This can potentially take some time, especially in Debug
             -- builds.
-            if clink.matches_ready(generation_id) then
+            if builder:matches_ready(generation_id) then
                 clink._keep_coroutine_events(c)
             end
         else
@@ -382,6 +386,16 @@ end
 --- -arg:   pattern:string
 --- -arg:   [full_path:boolean]
 --- -arg:   [find_func:function]
+--- Globs files using <span class="arg">pattern</span> and adds results as
+--- matches. If <span class="arg">full_path</span> is true then the path from
+--- <span class="arg">pattern</span> is prefixed to the results (otherwise only
+--- the file names are included). The last argument
+--- <span class="arg">find_func</span> is the function to use to do the
+--- globbing. If it's unspecified (or nil) Clink falls back to
+--- <a href="#clink.find_files">clink.find_files</a>.
+---
+--- Note: This exists for backward compatibility but malfunctions with some
+--- inputs, in the same ways it did in v0.4.9.
 function clink.match_files(pattern, full_path, find_func)
     -- This is ported from Clink v0.4.9 as identically as possible to minimize
     -- behavioral differences.  However, that was NOT a good implementation of
@@ -401,22 +415,27 @@ function clink.match_files(pattern, full_path, find_func)
     end
 
     -- Glob files.
+    local glob
     pattern = pattern:gsub("/", "\\")
-    local glob = find_func(pattern, true)
+    if type(find_func) == "function" then
+        glob = find_func(pattern, true)
+    end
 
     -- Get glob's base.
     local base = ""
-    local i = pattern:find("[\\:][^\\:]*$")
-    if i and full_path then
-        base = pattern:sub(1, i)
+    local pos = pattern:find("[\\:][^\\:]*$")
+    if pos and full_path then
+        base = pattern:sub(1, pos)
     end
 
     -- Match them.
     local num = 0
-    for _, i in ipairs(glob) do
-        local full = base..i
-        clink.add_match(full)
-        num = num + 1
+    if type(glob) == "table" then
+        for _, i in ipairs(glob) do
+            local full = base..tostring(i)
+            clink.add_match(full)
+            num = num + 1
+        end
     end
     return num
 end
@@ -445,6 +464,10 @@ end
 --- -arg:   matches:table
 --- -ret:   string
 --- This is no longer supported, and always returns an empty string.
+---
+--- Returning an empty string works because in Clink v1.x and higher match
+--- generators are no longer responsible for filtering matches.  The match
+--- pipeline itself handles that internally now.
 function clink.compute_lcd()
     _compat_warning("clink.compute_lcd() is no longer supported.")
     return ""
@@ -471,7 +494,7 @@ end
 --- <span class="arg">candidate</span> with a case insensitive comparison.
 ---
 --- Normally in Clink v1.x and higher the <span class="arg">needle</span> will
---- be an empty string because the generators are no longer responsible for
+--- be an empty string because match generators are no longer responsible for
 --- filtering matches.  The match pipeline itself handles that internally now.
 function clink.is_match(needle, candidate)
     if needle == nil then
@@ -489,7 +512,7 @@ end
 --- -deprecated: builder:addmatch
 --- -arg:   [files:boolean]
 --- This is only needed when using deprecated APIs.  It's automatically inferred
---- from the match type when using the current APIs.
+--- from the match types when using the current APIs.
 function clink.matches_are_files(files)
     if clink.co_state._current_builder then
         clink.co_state._current_builder:setmatchesarefiles(files)
@@ -522,7 +545,7 @@ end
 --- generators.  It has been superseded by the
 --- <a href="#line_state">line_state</a> type parameter passed into match
 --- generator functions when using the new
---- <a href="#clink.generator">clink.generator</a> API.
+--- <a href="#clink.generator">clink.generator()</a> API.
 
 --------------------------------------------------------------------------------
 --- -name:  clink.register_match_generator
@@ -553,7 +576,7 @@ end
 --- -show:  end
 function clink.register_match_generator(func, priority)
     local g = clink.generator(priority)
-    function g:generate(line_state, match_builder)
+    function g:generate(line_state, match_builder) -- luacheck: no unused
         local text = line_state:getendword()
         local info = line_state:getwordinfo(line_state:getwordcount())
         local first = info.offset
@@ -585,7 +608,7 @@ function clink._diag_generators()
     for _,generator in ipairs (_generators) do
         if generator.generate then
             local info = debug.getinfo(generator.generate, 'S')
-            if info.short_src ~= "?" then
+            if not clink._is_internal_script(info.short_src) then
                 print("  "..info.short_src..":"..info.linedefined)
                 any = true
             end

@@ -28,6 +28,7 @@ void            (*rl_fflush_function)(FILE*)                    = NULL;
 extern int is_exec_ext(const char* ext);
 extern void host_clear_suggestion();
 extern void end_recognizer();
+extern void end_task_manager();
 extern void host_filter_transient_prompt(int crlf);
 
 //------------------------------------------------------------------------------
@@ -112,7 +113,7 @@ int hooked_fwrite(const void* data, int size, int count, FILE* stream)
     else
     {
         size_t characters;
-    
+
         characters = MultiByteToWideChar(
             CP_UTF8, 0,
             (const char*)data, size,
@@ -280,11 +281,31 @@ int hooked_fstat(int fid, struct hooked_stat* out)
 //------------------------------------------------------------------------------
 void end_prompt(int crlf)
 {
+    extern void end_prompt_lf();
+
     host_clear_suggestion();
-    end_recognizer();
+
+    if (crlf < 0)
+    {
+        end_task_manager();
+        end_recognizer();
+    }
+
     host_filter_transient_prompt(crlf);
 
     _rl_move_vert(_rl_vis_botlin);
     if (crlf > 0)
+    {
+#ifdef INCLUDE_CLINK_DISPLAY_READLINE
+        end_prompt_lf();
+#else
         rl_crlf();
+#endif
+        _rl_last_c_pos = 0;
+    }
+
+#ifdef INCLUDE_CLINK_DISPLAY_READLINE
+    if (crlf < 0)
+        end_prompt_lf();
+#endif
 }

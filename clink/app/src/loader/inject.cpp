@@ -267,7 +267,7 @@ static remote_result inject_dll(DWORD target_pid, bool is_autorun, bool force_ho
     );
 #endif
     LOG("Version: %s", CLINK_VERSION_STR);
-    LOG("Arch: x%s", AS_STR(ARCHITECTURE));
+    LOG("Arch: %s", AS_STR(ARCHITECTURE_NAME));
     LOG("DLL: %s", dll_path.c_str());
 
     LOG("Parent pid: %d", target_pid);
@@ -315,6 +315,35 @@ static remote_result inject_dll(DWORD target_pid, bool is_autorun, bool force_ho
             LOG("Unknown host '%s'.", host_name ? host_name : "<no name>");
             if (!force_host)
                 return {};
+        }
+
+        // Can't inject (or get the command line) if the architecture doesn't
+        // match.
+        if (!cmd_process.is_arch_match())
+            return {};
+
+        // Parse cmd.exe command line for /c or /k to determine whether the host
+        // is interactive.  Don't waste time injecting a remote thread if Clink
+        // will cancel the inject anyway.  This helps make autorun more
+        // reasonable to use.
+        wstr<> command_line;
+        if (!cmd_process.get_command_line(command_line))
+        {
+            ERR("Unable to get host command line.");
+            return {};
+        }
+        for (const wchar_t* args = command_line.c_str(); args && (args = wcschr(args, '/'));)
+        {
+            ++args;
+            switch (tolower(*args))
+            {
+            case 'c':
+                LOG("Host is not interactive; cancelling inject.");
+                return { -1 };
+            case 'k':
+                args = nullptr;
+                break;
+            }
         }
     }
 
@@ -389,22 +418,15 @@ void get_profile_path(const char* in, str_base& out)
         }
     }
 
-    os::get_current_dir(out);
-
-    if (in[0] == '~' && (!in[1] || path::is_separator(in[1])))
+    // QUIRK:  --profile expanded tilde to %HOME%\AppData\Local, so to keep
+    // older installations working upon upgrade, Clink is locked into that
+    // strange and inconsistent behavior.
+    if (!path::tilde_expand(in, out, true/*use_appdata_local*/))
     {
-        wchar_t dir[MAX_PATH];
-        if (SHGetFolderPathW(0, CSIDL_LOCAL_APPDATA, nullptr, 0, dir) == S_OK)
-        {
-            out = dir;
-            ++in;
-            while (path::is_separator(*in))
-                ++in;
-        }
+        os::get_current_dir(out);
+        path::append(out, in);
+        path::normalise(out);
     }
-
-    path::append(out, in);
-    path::normalise(out);
 
     _in = out.c_str();
     os::get_full_path_name(_in.c_str(), out);
@@ -442,6 +464,11 @@ private:
 };
 
 //------------------------------------------------------------------------------
+const int exit_code_success = 0;
+const int exit_code_nonfatal = 1;
+const int exit_code_fatal = 2;
+
+//------------------------------------------------------------------------------
 int inject(int argc, char** argv)
 {
     // Autorun injection must always return success otherwise it interferes with
@@ -456,10 +483,11 @@ int inject(int argc, char** argv)
         { "quiet",       no_argument,        nullptr, 'q' },
         { "pid",         required_argument,  nullptr, 'd' },
         { "nolog",       no_argument,        nullptr, 'l' },
+        { "help",        no_argument,        nullptr, 'h' },
+        // Undocumented flags.
         { "autorun",     no_argument,        nullptr, '_' },
         { "detours",     no_argument,        nullptr, '^' },
         { "forcehost",   no_argument,        nullptr, '|' },
-        { "help",        no_argument,        nullptr, 'h' },
         { nullptr, 0, nullptr, 0 }
     };
 
@@ -479,7 +507,7 @@ int inject(int argc, char** argv)
     DWORD target_pid = 0;
     app_context::desc app_desc;
     int i;
-    int ret = 1;
+    int ret = exit_code_fatal;
     bool is_autorun = false;
     while ((i = getopt_long(argc, argv, "?lqhp:s:d:|", options, nullptr)) != -1)
     {
@@ -514,7 +542,10 @@ int inject(int argc, char** argv)
 
         case '?':
         case 'h':
-            ret = 0;
+            // Note: getopt returns '?' on invalid flags, making '-?'
+            // indistinguishable from an invalid flag.  So invalid flags end
+            // up returning 0 even though ideally they'd return 2.
+            ret = exit_code_success;
             // fall through
         default:
             puts_clink_header();
@@ -522,7 +553,10 @@ int inject(int argc, char** argv)
             puts("Options:");
             puts_help(help);
             puts("When installed for autorun, the automatic inject can be overridden by\n"
-                 "setting the CLINK_NOAUTORUN environment variable (to any value).");
+                 "setting the CLINK_NOAUTORUN environment variable (to any value).\n"
+                 "\n"
+                 "The exit code from inject is 0 if successful, 2 if a fatal error occurred,\n"
+                 "or 1 if a non-fatal error occurred (such as Clink was already present).");
             return ret;
         }
     }
@@ -531,13 +565,20 @@ int inject(int argc, char** argv)
     str<32> noautorun;
     if (is_autorun && os::get_env("clink_noautorun", noautorun))
     {
-        // Using WriteConsoleW to suppress the text if output is redirected so
-        // that it doesn't interfere with scripted parsing.
-        static const char c_msg[] = "Clink autorun is disabled by CLINK_NOAUTORUN.\n";
-        wstr<> wmsg(c_msg);
-        DWORD written;
-        WriteConsoleW(GetStdHandle(STD_OUTPUT_HANDLE), wmsg.c_str(), wmsg.length(), &written, nullptr);
-        return 1;
+#if 0
+        DWORD dummy;
+        HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (GetConsoleMode(h, &dummy))
+        {
+            // Only output this message when input has not been redirected, so
+            // that this doesn't interfere with scripted usage.
+            static const char c_msg[] = "Clink autorun is disabled by CLINK_NOAUTORUN.\n";
+            wstr<> wmsg(c_msg);
+            DWORD written;
+            WriteConsoleW(GetStdHandle(STD_OUTPUT_HANDLE), wmsg.c_str(), wmsg.length(), &written, nullptr);
+        }
+#endif
+        return exit_code_nonfatal;
     }
 
     // Start a log file.
@@ -629,6 +670,7 @@ int inject(int argc, char** argv)
         {
             fprintf(stderr, "Clink already loaded in process %d.\n", target_pid);
         }
+        ret = exit_code_nonfatal;
         return ret;
     }
 
@@ -639,7 +681,7 @@ int inject(int argc, char** argv)
         if (remote_dll_base.ok < 0)
         {
             errrep.set_ok();
-            ret = 0;
+            ret = exit_code_success;
         }
         return ret;
     }
@@ -664,14 +706,14 @@ int inject(int argc, char** argv)
     // If host validation fails when autorun, then don't report that as a
     // failure since it's an expected and common case.
     if (INT_PTR(rr.result) > 0)       // Success.
-        ret = 0;
+        ret = exit_code_success;
     else if (INT_PTR(rr.result) < 0)  // Ignorable failure; don't report error.
-        ret = 0;
+        ret = exit_code_success;
     else                              // Failure.
-        ret = 1;
+        ret = exit_code_fatal;
 
     if (!ret)
         errrep.set_ok();
 
-    return is_autorun ? 0 : ret;
+    return is_autorun ? exit_code_success : ret;
 }

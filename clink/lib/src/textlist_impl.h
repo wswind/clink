@@ -16,14 +16,15 @@ class printer;
 enum class mouse_input_type : unsigned char;
 
 //------------------------------------------------------------------------------
-typedef const char* (*textlist_line_getter_t)(int index);
-
-//------------------------------------------------------------------------------
-struct entry_info
+enum class textlist_mode
 {
-    int             index;
-    bool            marked;
+    general,
+    directories,
+    history,
+    win_history,
 };
+
+inline bool is_history_mode(textlist_mode mode) { return mode == textlist_mode::history || mode == textlist_mode::win_history; }
 
 //------------------------------------------------------------------------------
 class textlist_impl
@@ -44,17 +45,19 @@ class textlist_impl
         const char* get_col_text(int row, int col) const;
         int         get_col_width(int col) const;
         const char* add_entry(const char* entry);
+        bool        get_any_tabs() const;
         void        clear();
     private:
         textlist_impl::item_store& m_store;
         std::vector<column_text> m_rows;
         int         m_longest[max_columns] = {};
+        bool        m_any_tabs = false;
     };
 
 public:
                     textlist_impl(input_dispatcher& dispatcher);
 
-    popup_results   activate(const char* title, const char** entries, int count, int index, bool reverse, int history_mode, entry_info* infos, bool columns);
+    popup_results   activate(const char* title, const char** entries, int count, int index, bool reverse, textlist_mode mode, entry_info* infos, bool columns, const popup_config* config=nullptr);
     bool            is_active() const;
     bool            accepts_mouse_input(mouse_input_type type) const;
 
@@ -74,6 +77,8 @@ private:
     void            update_top();
     void            update_display();
     void            set_top(int top);
+    void            adjust_horz_offset(int delta);
+    void            init_colors(const popup_config* config);
     void            reset();
 
     // Result.
@@ -86,6 +91,7 @@ private:
     line_buffer*    m_buffer = nullptr;
     printer*        m_printer = nullptr;
     int             m_bind_group = -1;
+    del_callback_t  m_del_callback = nullptr;
 
     // Layout.
     int             m_screen_cols = 0;
@@ -94,6 +100,9 @@ private:
     int             m_mouse_left = 0;
     int             m_mouse_width = 0;
     int             m_visible_rows = 0;
+    int             m_max_num_len = 0;
+    int             m_horz_offset = 0;
+    int             m_longest_visible = 0;
     str<32>         m_default_title;
     str<32>         m_override_title;
     bool            m_has_override_title = false;
@@ -106,10 +115,6 @@ private:
     std::vector<const char*> m_items;       // Escaped entries for display.
     int             m_longest = 0;
     addl_columns    m_columns;
-    bool            m_reverse = false;
-    bool            m_history_mode = false;
-    bool            m_win_history = false;
-    bool            m_has_columns = false;
 
     // Current entry.
     int             m_top = 0;
@@ -121,6 +126,18 @@ private:
     bool            m_needle_is_number = false;
     bool            m_input_clears_needle = false;
     scroll_helper   m_scroll_helper;
+
+    // Configuration.
+    unsigned int    m_pref_height = 0;      // Automatic.
+    unsigned int    m_pref_width = 0;       // Automatic.
+    textlist_mode   m_mode = textlist_mode::general;
+    bool            m_reverse = false;
+    bool            m_history_mode = false;
+    bool            m_show_numbers = false;
+    bool            m_horz_scrolling = false;
+    bool            m_win_history = false;
+    bool            m_has_columns = false;
+    popup_colors    m_color;
 
     // Content store.
     class item_store
@@ -142,6 +159,3 @@ private:
     };
     item_store      m_store;
 };
-
-//------------------------------------------------------------------------------
-popup_results activate_history_text_list(const char** history, int count, int index, entry_info* infos, int history_mode);

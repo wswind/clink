@@ -1,4 +1,4 @@
-// Copyright (c) 2016 Martin Ridgers
+﻿// Copyright (c) 2016 Martin Ridgers
 // License: http://opensource.org/licenses/MIT
 
 #include "pch.h"
@@ -14,6 +14,7 @@
 #include "popup.h"
 #include "textlist_impl.h"
 #include "display_matches.h"
+#include "display_readline.h"
 
 #include "rl_suggestions.h"
 
@@ -34,6 +35,10 @@
 #include <terminal/screen_buffer.h>
 #include <terminal/scroll.h>
 
+#ifdef LOG_OUTPUT_CALLSTACKS
+#include <core/callstack.h>
+#endif
+
 #include <signal.h>
 #include <unordered_set>
 
@@ -51,6 +56,9 @@ extern "C" {
 extern int find_streqn (const char *a, const char *b, int n);
 extern void rl_replace_from_history(HIST_ENTRY *entry, int flags);
 extern int _rl_get_inserted_char(void);
+extern char* tgetstr(const char*, char**);
+extern int tputs(const char* str, int affcnt, int (*putc_func)(int));
+extern char* tgoto(const char* base, int x, int y);
 extern Keymap _rl_dispatching_keymap;
 #define HIDDEN_FILE(fn) ((fn)[0] == '.')
 #if defined (COLOR_SUPPORT)
@@ -64,7 +72,6 @@ static FILE*        null_stream = (FILE*)1;
 static FILE*        in_stream = (FILE*)2;
 static FILE*        out_stream = (FILE*)3;
 extern "C" int      mk_wcwidth(char32_t);
-extern "C" char*    tgetstr(const char*, char**);
 const int RL_MORE_INPUT_STATES = ~(RL_STATE_CALLBACK|
                                    RL_STATE_INITIALIZED|
                                    RL_STATE_OVERWRITE|
@@ -86,8 +93,6 @@ extern int          _rl_last_v_pos;
 
 extern int clink_diagnostics(int, int);
 
-extern int host_add_history(int rl_history_index, const char* line);
-extern int host_remove_history(int rl_history_index, const char* line);
 extern void host_send_event(const char* event_name);
 extern void host_cleanup_after_signal();
 extern int macro_hook_func(const char* macro);
@@ -97,6 +102,7 @@ extern void update_matches();
 extern void reset_generate_matches();
 extern void force_update_internal(bool restrict);
 extern matches* maybe_regenerate_matches(const char* needle, display_filter_flags flags);
+extern void signal_terminal_resized();
 extern setting_color g_color_interact;
 extern int g_prompt_refilter;
 extern int g_prompt_redisplay;
@@ -139,8 +145,7 @@ setting_bool g_ctrld_exits(
 static setting_color g_color_arg(
     "color.arg",
     "Argument color",
-    "The color for arguments in the input line.  Only used when\n"
-    "clink.colorize_input is set.",
+    "The color for arguments in the input line.",
     "bold");
 
 static setting_color g_color_arginfo(
@@ -154,10 +159,9 @@ static setting_color g_color_arginfo(
 static setting_color g_color_argmatcher(
     "color.argmatcher",
     "Argmatcher color",
-    "The color for a command name that has an argmatcher.  Only used when\n"
-    "clink.colorize_input is set.  If a command name has an argmatcher available,\n"
-    "then this color will be used for the command name, otherwise the doskey, cmd,\n"
-    "or input color will be used.",
+    "The color for a command name that has an argmatcher.  If a command name has\n"
+    "an argmatcher available, then this color will be used for the command name,\n"
+    "otherwise the doskey, cmd, or input color will be used.",
     "");
 
 static setting_color g_color_cmd(
@@ -194,14 +198,20 @@ static setting_color g_color_filtered(
 static setting_color g_color_flag(
     "color.flag",
     "Flag color",
-    "The color for flags in the input line.  Only used when clink.colorize_input is\n"
-    "set.",
+    "The color for flags in the input line.",
     "default");
 
 static setting_color g_color_hidden(
     "color.hidden",
     "Hidden file completions",
     "Used when Clink displays file completions with the hidden attribute.",
+    "");
+
+setting_color g_color_histexpand(
+    "color.histexpand",
+    "History expansion color",
+    "The color for history expansions in the input line.  When this is not set,\n"
+    "history expansions are not colored.",
     "");
 
 static setting_color g_color_horizscroll(
@@ -227,7 +237,7 @@ static setting_color g_color_modmark(
     "color.modmark",
     "Modified history line mark color",
     "Used when Clink displays the * mark on modified history lines when\n"
-    "mark-modified-lines is set and color.input is set.",
+    "mark-modified-lines is set.",
     "");
 
 setting_color g_color_popup(
@@ -279,11 +289,9 @@ static setting_color g_color_suggestion(
 static setting_color g_color_unexpected(
     "color.unexpected",
     "Unexpected argument color",
-    "The color for unexpected arguments in the input line.  Only used when\n"
-    "clink.colorize_input is set.  An argument is unexpected if an argument matcher\n"
-    "expected there to be no more arguments in the input line or if the word\n"
-    "doesn't match any expected\n"
-    "values.",
+    "The color for unexpected arguments in the input line.  An argument is\n"
+    "unexpected if an argument matcher expected there to be no more arguments\n"
+    "in the input line or if the word doesn't match any expected values.",
     "default");
 
 setting_color g_color_unrecognized(
@@ -293,6 +301,13 @@ setting_color g_color_unrecognized(
     "recognized as a command, doskey macro, directory, argmatcher, or executable\n"
     "file.",
     "");
+
+setting_bool g_match_expand_abbrev(
+    "match.expand_abbrev",
+    "Expand abbreviated paths when completing",
+    "Expands unambiguously abbreviated directories in a path when performing\n"
+    "completion.",
+    true);
 
 setting_bool g_match_expand_envvars(
     "match.expand_envvars",
@@ -318,7 +333,7 @@ static setting_bool g_rl_hide_stderr(
     "Suppress stderr from the Readline library",
     false);
 
-static setting_bool g_debug_log_terminal(
+setting_bool g_debug_log_terminal(
     "debug.log_terminal",
     "Log Readline terminal input and output",
     "WARNING:  Only turn this on for diagnostic purposes, and only temporarily!\n"
@@ -336,7 +351,6 @@ setting_enum g_default_bindings(
     0);
 
 extern setting_bool g_terminal_raw_esc;
-extern setting_bool g_gui_popups;
 
 
 
@@ -360,8 +374,11 @@ static int clink_event_hook()
         rl_callback_sigcleanup();
         rl_echo_signal_char(SIGBREAK);
     }
+
     _rl_move_vert(_rl_vis_botlin);
     rl_crlf();
+    _rl_last_c_pos = 0;
+
     host_cleanup_after_signal();
     clink_reset_event_hook();
     return 0;
@@ -380,6 +397,32 @@ static BOOL WINAPI clink_ctrlevent_handler(DWORD ctrl_type)
     {
         clink_signal = (ctrl_type == CTRL_C_EVENT) ? SIGINT : SIGBREAK;
         interrupt_input();
+    }
+    else if (ctrl_type == CTRL_CLOSE_EVENT)
+    {
+        // Issue 296 reported that on some computers the addition of signal
+        // handling caused the OS to show a dialog box because CMD takes too
+        // long to exit.  I have no idea how the signal handler could cause
+        // that; docs for SetConsoleCtrlHandler state that regardless what the
+        // handler returns for CTRL_CLOSE_EVENT, the OS will terminate the
+        // process.  But on at least one computer that is not proving to be
+        // true for some unknown reason.  I think there has to be external
+        // software involved somehow.  The issue was reported on a work computer
+        // that has antivirus and other software installed by policy, so it is a
+        // plausible hypothesis.
+        //
+        // Surprisingly, the C runtime treats CTRL_CLOSE_EVENT the same as
+        // CTRL_BREAK_EVENT.  So, there is effectively a signal handler
+        // installed for CTRL_CLOSE_EVENT, even though there is no intent to
+        // do anything in response to CTRL_CLOSE_EVENT, and it ends up returning
+        // TRUE instead of FALSE.  That shouldn't have any effect, but it's the
+        // only observable difference within Clink, so maybe it's somehow
+        // interfering with some other software that participates in system
+        // operations.  Since the CTRL_CLOSE_EVENT should result in guaranteed
+        // termination, there's no need to preserve installed signal handlers.
+        // So, by removing the SIGBREAK handler, it should remove the TRUE vs
+        // FALSE difference and restore the previous behavior.
+        signal(SIGBREAK, nullptr);
     }
     return false;
 }
@@ -421,7 +464,7 @@ void clink_shutdown_ctrlevent()
 }
 
 //------------------------------------------------------------------------------
-static void _cdecl dummy_display_matches_hook(char**, int, int)
+static void __cdecl dummy_display_matches_hook(char**, int, int)
 {
     // This exists purely to prevent rl_complete_internal from setting up
     // _rl_complete_sigcleanup and freeing matches out from under Clink code.
@@ -588,6 +631,50 @@ public:
 private:
     const char* bindableEsc = get_bindable_esc();
 };
+
+//------------------------------------------------------------------------------
+static bool is_readline_input_pending()
+{
+    return (rl_pending_input ||
+            _rl_pushed_input_available() ||
+            RL_ISSTATE(RL_STATE_MACROINPUT) ||
+            rl_executing_macro);
+}
+
+//------------------------------------------------------------------------------
+static unsigned int* s_input_len_ptr = nullptr;
+static bool s_input_more = false;
+extern "C" int input_available_hook(void)
+{
+    assert(s_direct_input);
+    if (s_direct_input)
+    {
+        // These are in order of next-ness:
+
+        // Any remaining read-but-not-processed bytes in input chord?
+        if (s_input_len_ptr && *s_input_len_ptr > 0)
+            return true;
+
+        // Any read-but-not-processed bytes not yet in input chord?  The binding
+        // resolver may have more bytes pending.
+        if (s_input_more)
+            return true;
+
+        // Any pending input from Readline?
+        if (is_readline_input_pending())
+            return true;
+
+        // Any unread input available from stdin?
+        // Passing -1 returns the current timeout without changing it.  The
+        // timeout is in microseconds (µsec) so divide by 1000 for milliseconds.
+        const int timeout = rl_set_keyboard_input_timeout(-1);
+        if (s_direct_input->available(timeout > 0 ? timeout / 1000 : 0))
+            return true;
+    }
+    return false;
+}
+
+//------------------------------------------------------------------------------
 extern "C" int read_key_hook(void)
 {
     assert(s_direct_input);
@@ -724,13 +811,20 @@ static void terminal_write_thunk(FILE* stream, const char* chars, int char_count
 }
 
 //------------------------------------------------------------------------------
+static int s_puts_face = 0;
 static void terminal_log_write(FILE* stream, const char* chars, int char_count)
 {
     if (stream == out_stream)
     {
         assert(g_printer);
         LOGCURSORPOS();
-        LOG("RL_OUTSTREAM \"%.*s\", %d", char_count, chars, char_count);
+#ifdef LOG_OUTPUT_CALLSTACKS
+        char stk[8192];
+        format_callstack(2, 20, stk, sizeof(stk), false);
+        LOG("%s \"%.*s\", %d -- %s", s_puts_face ? "PUTSFACE" : "RL_OUTSTREAM", char_count, chars, char_count, stk);
+#else
+        LOG("%s \"%.*s\", %d", s_puts_face ? "PUTSFACE" : "RL_OUTSTREAM", char_count, chars, char_count);
+#endif
         g_printer->print(chars, char_count);
         return;
     }
@@ -788,6 +882,7 @@ static const char* s_flag_color = nullptr;
 static const char* s_unrecognized_color = nullptr;
 static const char* s_none_color = nullptr;
 static const char* s_suggestion_color = nullptr;
+static const char* s_histexpand_color = nullptr;
 int g_suggestion_offset = -1;
 
 //------------------------------------------------------------------------------
@@ -804,9 +899,11 @@ bool is_showing_argmatchers()
 // the prompt again after it's already been displayed, it's necessary to draw
 // the prefix again.  To do that, it's necessary to know how many lines to move
 // up to reach the beginning of the prompt prefix.
-int count_prompt_lines(const char* prompt_prefix, int len)
+//
+// Note:  This only counts whole lines; i.e. caused by newline or wrapping.
+int count_prompt_lines(const char* prompt_prefix)
 {
-    if (len <= 0 || !prompt_prefix)
+    if (!prompt_prefix || !*prompt_prefix)
         return 0;
 
     assert(_rl_screenwidth > 0);
@@ -816,7 +913,11 @@ int count_prompt_lines(const char* prompt_prefix, int len)
     int cells = 0;
     bool ignore = false;
 
-    str_iter iter(prompt_prefix, len);
+    str<> bracketed;
+    ecma48_processor_flags flags = ecma48_processor_flags::bracket;
+    ecma48_processor(prompt_prefix, &bracketed, nullptr/*cell_count*/, flags);
+
+    str_iter iter(bracketed.c_str(), bracketed.length());
     while (int c = iter.next())
     {
         if (ignore)
@@ -851,8 +952,6 @@ int count_prompt_lines(const char* prompt_prefix, int len)
         }
         cells += w;
     }
-
-    assert(!cells);
 
     return lines;
 }
@@ -889,15 +988,22 @@ inline const char* fallback_color(const char* preferred, const char* fallback)
 static void puts_face_func(const char* s, const char* face, int n)
 {
     static const char c_normal[] = "\x1b[m";
+    static const char c_hyperlink[] = "\x1b]8;;";
+    static const char c_doc_histexpand[] = "https://chrisant996.github.io/clink/clink.html#using-history-expansion";
+    static const char c_BEL[] = "\a";
 
     str<280> out;
-    char cur_face = '0';
+    const char* const other_color = fallback_color(s_input_color, c_normal);
+    char cur_face = FACE_NORMAL;
 
     while (n)
     {
         // Append face string if face changed.
         if (cur_face != *face)
         {
+            if (cur_face == FACE_HISTEXPAND)
+                out << c_hyperlink << c_BEL;
+
             cur_face = *face;
             switch (cur_face)
             {
@@ -915,50 +1021,41 @@ static void puts_face_func(const char* s, const char* face, int n)
                     }
                 }
                 // fall through
-            case '0':   out << c_normal; break;
-            case '1':   out << "\x1b[0;7m"; break;
+            case FACE_NORMAL:       out << c_normal; break;
+            case FACE_STANDOUT:     out << "\x1b[0;7m"; break;
 
-            case '2':   out << fallback_color(s_input_color, c_normal); break;
-            case '*':   out << fallback_color(_rl_display_modmark_color, c_normal); break;
-            case '(':   out << fallback_color(_rl_display_message_color, c_normal); break;
-            case '<':   out << fallback_color(_rl_display_horizscroll_color, c_normal); break;
-            case '#':   out << fallback_color(s_selection_color, "\x1b[0;7m"); break;
-            case '-':   out << fallback_color(s_suggestion_color, "\x1b[0;90m"); break;
+            case FACE_INPUT:        out << fallback_color(s_input_color, c_normal); break;
+            case FACE_MODMARK:      out << fallback_color(_rl_display_modmark_color, c_normal); break;
+            case FACE_MESSAGE:      out << fallback_color(_rl_display_message_color, c_normal); break;
+            case FACE_SCROLL:       out << fallback_color(_rl_display_horizscroll_color, c_normal); break;
+            case FACE_SELECTION:    out << fallback_color(s_selection_color, "\x1b[0;7m"); break;
+            case FACE_SUGGESTION:   out << fallback_color(s_suggestion_color, "\x1b[0;90m"); break;
+            case FACE_HISTEXPAND:   out << fallback_color(s_histexpand_color, "\x1b[0;97;45m")
+                                        << c_hyperlink << c_doc_histexpand << c_BEL; break;
 
-            case 'o':
-other:
-                out << fallback_color(s_input_color, c_normal);
-                break;
-            case 'u':
-                if (!s_unrecognized_color)
-                    goto other;
-                out << s_unrecognized_color;
-                break;
-            case 'x':
-                if (!s_executable_color)
-                    goto other;
-                out << s_executable_color;
-                break;
-            case 'c':
+            case FACE_OTHER:        out << other_color; break;
+            case FACE_UNRECOGNIZED: out << fallback_color(s_unrecognized_color, other_color); break;
+            case FACE_EXECUTABLE:   out << fallback_color(s_executable_color, other_color); break;
+            case FACE_COMMAND:
                 if (_rl_command_color)
                     out << "\x1b[" << _rl_command_color << "m";
                 else
                     out << c_normal;
                 break;
-            case 'd':
+            case FACE_ALIAS:
                 if (_rl_alias_color)
                     out << "\x1b[" << _rl_alias_color << "m";
                 else
                     out << c_normal;
                 break;
-            case 'm':
+            case FACE_ARGMATCHER:
                 assert(s_argmatcher_color); // Shouldn't reach here otherwise.
                 if (s_argmatcher_color) // But avoid crashing, just in case.
                     out << s_argmatcher_color;
                 break;
-            case 'a':   out << fallback_color(s_arg_color, fallback_color(s_input_color, c_normal)); break;
-            case 'f':   out << fallback_color(s_flag_color, c_normal); break;
-            case 'n':   out << fallback_color(s_none_color, c_normal); break;
+            case FACE_ARGUMENT:     out << fallback_color(s_arg_color, fallback_color(s_input_color, c_normal)); break;
+            case FACE_FLAG:         out << fallback_color(s_flag_color, c_normal); break;
+            case FACE_NONE:         out << fallback_color(s_none_color, c_normal); break;
             }
         }
 
@@ -977,16 +1074,14 @@ other:
         out.concat(s_concat, len);
     }
 
-    if (cur_face != '0')
-        out.concat(c_normal);
+    if (cur_face == FACE_HISTEXPAND)
+        out << c_hyperlink << c_BEL;
+    if (cur_face != FACE_NORMAL)
+        out << c_normal;
 
-    if (g_debug_log_terminal.get())
-    {
-        LOGCURSORPOS();
-        LOG("PUTSFACE \"%.*s\", %d", out.length(), out.c_str(), out.length());
-    }
-
-    g_printer->print(out.c_str(), out.length());
+    ++s_puts_face;
+    rl_fwrite_function(_rl_out_stream, out.c_str(), out.length());
+    --s_puts_face;
 }
 
 
@@ -1024,7 +1119,7 @@ void hook_display()
 
     if (!s_suggestion.more() || rl_point != rl_end)
     {
-        rl_redisplay();
+        display_readline();
         return;
     }
 
@@ -1041,13 +1136,19 @@ void hook_display()
         rl_end = tmp.length();
     }
 
-    rl_redisplay();
+    display_readline();
 }
 
 //------------------------------------------------------------------------------
 bool can_suggest(const line_state& line)
 {
     return s_suggestion.can_suggest(line);
+}
+
+//------------------------------------------------------------------------------
+bool accepted_whole_suggestion()
+{
+    return s_suggestion.accepted_whole_suggestion();
 }
 
 //------------------------------------------------------------------------------
@@ -1391,26 +1492,78 @@ static char** alternative_matches(const char* text, int start, int end)
     if (rl_completion_type == '?' && strcmp(text, "~") == 0)
         return nullptr;
 
-    str<> tmp;
+    // Strip quotes so `"foo\"ba` can complete to `"foo\bar"`.  Stripping
+    // quotes may seem surprising, but it's what CMD does and it works well.
+    str_moveable tmp;
+    concat_strip_quotes(tmp, text);
+
+    // Handle tilde expansion.
+    bool just_tilde = false;
+    if (rl_complete_with_tilde_expansion && tmp.c_str()[0] == '~')
+    {
+        just_tilde = !tmp.c_str()[1];
+        if (!path::tilde_expand(tmp))
+            just_tilde = false;
+    }
+
+    // Expand an abbreviated path.
+    override_match_line_state omls;
+    if (g_match_expand_abbrev.get() && !s_matches->get_match_count())
+    {
+        const char* in = tmp.c_str();
+        str_moveable expanded;
+        const bool disambiguated = os::disambiguate_abbreviated_path(in, expanded);
+        if (expanded.length())
+        {
+#ifdef DEBUG
+            if (dbg_get_env_int("DEBUG_EXPANDABBREV"))
+                printf("\x1b[s\x1b[H\x1b[97;48;5;22mEXPANDED:  \"%s\" + \"%s\" (%s)\x1b[m\x1b[K\x1b[u", expanded.c_str(), in, disambiguated ? "UNIQUE" : "ambiguous");
+#endif
+            if (!disambiguated)
+            {
+stop:
+                assert(g_rl_buffer);
+                g_rl_buffer->begin_undo_group();
+                g_rl_buffer->remove(start, start + in - tmp.c_str());
+                g_rl_buffer->set_cursor(start);
+                g_rl_buffer->insert(expanded.c_str());
+                g_rl_buffer->end_undo_group();
+                // Force the menu-complete family of commands to regenerate
+                // matches, otherwise they'll have no matches.
+                override_rl_last_func(nullptr, true/*force_when_null*/);
+                return nullptr;
+            }
+            else
+            {
+                expanded.concat(in);
+                assert(in + strlen(in) == tmp.c_str() + tmp.length());
+                in = tmp.c_str() + tmp.length();
+                if (path::is_separator(expanded[expanded.length() - 1]))
+                    goto stop;
+                tmp = std::move(expanded);
+                // Override the input editor's line state info to generate
+                // matches using the expanded path, without actually modifying
+                // the Readline line buffer (since we're inside a Readline
+                // callback and Readline isn't prepared for the buffer to
+                // change out from under it).
+                const char qc = need_leading_quote(tmp.c_str(), true);
+                omls.override(start, end, tmp.c_str(), qc);
+                // Perform completion again after the expansion.
+                update_matches();
+                if (matches* regen = maybe_regenerate_matches(tmp.c_str(), flags))
+                {
+                    // It's ok to redirect s_matches here because s_matches is reset in
+                    // every rl_module::on_input() call.
+                    s_matches = regen;
+                }
+            }
+        }
+    }
+
+    // Handle the match.wild setting.
     const char* pattern = nullptr;
     if (is_complete_with_wild())
     {
-        // Strip quotes so `"foo\"ba` can complete to `"foo\bar"`.  Stripping
-        // quotes may seem surprising, but it's what CMD does and it works well.
-        concat_strip_quotes(tmp, text);
-
-        bool just_tilde = false;
-        if (rl_complete_with_tilde_expansion)
-        {
-            char* expanded = tilde_expand(tmp.c_str());
-            if (expanded && strcmp(tmp.c_str(), expanded) != 0)
-            {
-                just_tilde = (tmp.c_str()[0] == '~' && tmp.c_str()[1] == '\0');
-                tmp = expanded;
-            }
-            free(expanded);
-        }
-
         if (!is_literal_wild() && !just_tilde)
             tmp.concat("*");
         pattern = tmp.c_str();
@@ -1481,29 +1634,17 @@ static char** alternative_matches(const char* text, int start, int end)
         const char* const match = iter.get_match();
         const char* const display = iter.get_match_display();
         const char* const description = iter.get_match_description();
-        const int match_len = strlen(match);
-        const int match_display_len = display ? strlen(display) : 0;
-        const int match_description_len = description ? strlen(description) : 0;
-        const int match_size = match_len + 1 + 1/*type*/ + 1/*append_char*/ + 1/*flags*/ + match_display_len + 1 + match_description_len + 1;
-        char* ptr = (char*)malloc(match_size);
+        const size_t packed_size = calc_packed_size(match, display, description);
+        char* ptr = (char*)malloc(packed_size);
 
         matches[count] = ptr;
 
-        memcpy(ptr, match, match_len);
-        ptr += match_len;
-        *(ptr++) = '\0';
-
-        *(ptr++) = (char)type;
-        *(ptr++) = (char)iter.get_match_append_char();
-        *(ptr++) = (char)flags;
-
-        memcpy(ptr, display, match_display_len);
-        ptr += match_display_len;
-        *(ptr++) = '\0';
-
-        memcpy(ptr, description, match_description_len);
-        ptr += match_description_len;
-        *(ptr++) = '\0';
+        if (!pack_match(ptr, packed_size, match, type, display, description, iter.get_match_append_char(), flags, nullptr, false))
+        {
+            --count;
+            free(ptr);
+            continue;
+        }
 
 #ifdef DEBUG
         // Set DEBUG_MATCHES=-5 to print the first 5 matches.
@@ -1569,114 +1710,6 @@ static int maybe_strlen(const char* s)
 }
 
 //------------------------------------------------------------------------------
-int clink_popup_complete(int count, int invoking_key)
-{
-    if (!g_gui_popups.get())
-        return clink_select_complete(count, invoking_key);
-
-    if (!s_matches)
-    {
-        rl_ding();
-        return 0;
-    }
-
-    rl_completion_invoking_key = invoking_key;
-
-    // Collect completions.
-    int match_count;
-    char* orig_text;
-    int orig_start;
-    int orig_end;
-    int delimiter;
-    char quote_char;
-    bool completing = true;
-    bool free_match_strings = true;
-    rollback<bool> popup_scope(s_is_popup, true);
-    char** matches = rl_get_completions('?', &match_count, &orig_text, &orig_start, &orig_end, &delimiter, &quote_char);
-    if (!matches)
-        return 0;
-
-    // Identify common prefix.
-    char* end_prefix = rl_last_path_separator(orig_text);
-    if (end_prefix)
-        end_prefix++;
-    else if (ISALPHA((unsigned char)orig_text[0]) && orig_text[1] == ':')
-        end_prefix = (char*)orig_text + 2;
-    int len_prefix = end_prefix ? end_prefix - orig_text : 0;
-
-    // Match display filter.
-    bool display_filtered = false;
-    const display_filter_flags flags = (display_filter_flags::selectable | display_filter_flags::plainify);
-    match_display_filter_entry** filtered_matches = match_display_filter(s_needle.c_str(), matches, flags);
-    if (filtered_matches && filtered_matches[0] && filtered_matches[1])
-    {
-        display_filtered = true;
-        _rl_free_match_list(matches);
-        free_match_strings = false;
-        matches = nullptr;
-
-        completing = false; // Has intentional side effect of disabling auto_complete.
-
-        match_count = 0;
-        for (int i = 1; filtered_matches[i]; i++)
-            match_count += !!filtered_matches[i]->match[0]; // Count non-empty matches.
-
-        if (match_count)
-        {
-            matches = (char**)calloc(match_count + 1, sizeof(*matches));
-            if (matches)
-            {
-                int j = 0;
-                for (int i = 1; filtered_matches[i]; i++)
-                {
-                    if (filtered_matches[i]->match[0]) // Count non-empty matches.
-                        matches[j++] = filtered_matches[i]->buffer;
-                }
-                assert(j == match_count);
-                matches[match_count] = nullptr;
-            }
-        }
-    }
-
-    create_matches_lookaside(matches);
-
-    // Popup list.
-    int current = 0;
-    const char* choice;
-    switch (do_popup_list("Completions", (const char **)matches, match_count,
-                          len_prefix, completing,
-                          true/*auto_complete*/, false/*reverse_find*/,
-                          current, choice, display_filtered ? popup_items_mode::display_filter : popup_items_mode::descriptions))
-    {
-    case popup_result::cancel:
-        break;
-    case popup_result::error:
-        rl_ding();
-        break;
-    case popup_result::select:
-    case popup_result::use:
-        rl_insert_match(choice, orig_text, orig_start, delimiter, quote_char);
-        break;
-    }
-
-    _rl_reset_completion_state();
-
-    free(orig_text);
-    if (free_match_strings)
-    {
-        _rl_free_match_list(matches);
-    }
-    else
-    {
-        destroy_matches_lookaside(matches);
-        free(matches);
-    }
-    free_filtered_matches(filtered_matches);
-
-    return 0;
-}
-
-//------------------------------------------------------------------------------
 int clink_popup_history(int count, int invoking_key)
 {
     HIST_ENTRY** list = history_list();
@@ -1718,23 +1751,9 @@ int clink_popup_history(int count, int invoking_key)
         current = total - 1;
 
     // Popup list.
-    popup_result result;
-    if (!g_gui_popups.get())
-    {
-        popup_results results = activate_history_text_list(const_cast<const char**>(history), total, current, infos, true);
-        result = results.m_result;
-        current = results.m_index;
-    }
-    else
-    {
-        const char* choice;
-        result = do_popup_list("History",
-            const_cast<const char**>(history), total, 0,
-            false/*completing*/, false/*auto_complete*/, true/*reverse_find*/,
-            current, choice);
-    }
+    const popup_results results = activate_history_text_list(const_cast<const char**>(history), total, current, infos, false/*win_history*/);
 
-    switch (result)
+    switch (results.m_result)
     {
     case popup_result::cancel:
         break;
@@ -1747,15 +1766,15 @@ int clink_popup_history(int count, int invoking_key)
             rl_maybe_save_line();
             rl_maybe_replace_line();
 
-            current = infos[current].index;
-            history_set_pos(current);
+            const int pos = infos[results.m_index].index;
+            history_set_pos(pos);
             rl_replace_from_history(current_history(), 0);
 
             bool point_at_end = (!search_len || _rl_history_point_at_end_of_anchored_search);
             rl_point = point_at_end ? rl_end : search_len;
             rl_mark = point_at_end ? search_len : rl_end;
 
-            if (result == popup_result::use)
+            if (results.m_result == popup_result::use)
             {
                 (*rl_redisplay_function)();
                 rl_newline(1, invoking_key);
@@ -1852,6 +1871,7 @@ static void init_readline_hooks()
     rl_puts_face_func = puts_face_func;
 
     // Input event hooks.
+    rl_input_available_hook = input_available_hook;
     rl_read_key_hook = read_key_hook;
     rl_buffer_changing_hook = buffer_changing;
     rl_selection_event_hook = cua_selection_event_hook;
@@ -1903,6 +1923,15 @@ void initialise_readline(const char* shell_name, const char* state_dir, const ch
     // would be more functionally correct.
     _rl_comment_begin = savestring("::");
 
+    // Disable _rl_optimize_typeahead for two reasons:
+    //  1.  It is incompatible with READLINE_CALLBACKS because it calls
+    //      rl_read_key() directly.
+    //  2.  Clink's implementation of input_available_hook() can't predict
+    //      whether the input will actually reach Readline, and rl_insert's
+    //      _rl_optimize_typeahead mode assumes that all input will reach
+    //      Readline.
+    _rl_optimize_typeahead = false;
+
     // CMD does not consider backslash to be an escape character (in particular,
     // it cannot escape a space).
     history_host_backslash_escape = 0;
@@ -1943,8 +1972,9 @@ void initialise_readline(const char* shell_name, const char* state_dir, const ch
         clink_add_funmap_entry("clink-old-menu-complete-numbers", clink_old_menu_complete_numbers, keycat_completion, "Like 'old-menu-complete' using numbers from the current screen");
         clink_add_funmap_entry("clink-old-menu-complete-numbers-backward", clink_old_menu_complete_numbers_backward, keycat_completion, "Like 'old-menu-complete-backward' using numbers from the current screen");
         clink_add_funmap_entry("clink-paste", clink_paste, keycat_basic, "Pastes text from the clipboard");
-        clink_add_funmap_entry("clink-popup-complete", clink_popup_complete, keycat_completion, "Perform completion with a popup list of possible completions");
-        clink_add_funmap_entry("clink-popup-complete-numbers", clink_popup_complete_numbers, keycat_completion, "Perform completion with a popup list of numbers from the current screen");
+        // clink_add_funmap_entry("clink-popup-complete", clink_select_complete, keycat_completion, "Perform completion by selecting from an interactive list of possible completions; if there is only one match, insert it");
+        rl_add_funmap_entry("clink-popup-complete", clink_select_complete);
+        clink_add_funmap_entry("clink-popup-complete-numbers", clink_popup_complete_numbers, keycat_completion, "Perform interactive completion from a list of numbers from the current screen");
         clink_add_funmap_entry("clink-popup-directories", clink_popup_directories, keycat_misc, "Show recent directories in a popup list and 'cd /d' to a selected directory");
         clink_add_funmap_entry("clink-popup-history", clink_popup_history, keycat_history, "Show history entries in a popup list.  Filters using any text before the cursor point.  Executes or inserts a selected history entry");
         clink_add_funmap_entry("clink-popup-show-help", clink_popup_show_help, keycat_misc, "Show all key bindings in a searching popup list and execute a selected key binding");
@@ -2016,11 +2046,6 @@ void initialise_readline(const char* shell_name, const char* state_dir, const ch
         rl_catch_signals = 1;
         _rl_echoctl = 1;
         _rl_intr_char = CTRL('C');
-        signal(SIGINT, clink_sighandler);
-#ifdef SIGBREAK
-        signal(SIGBREAK, clink_sighandler);
-#endif
-        SetConsoleCtrlHandler(clink_ctrlevent_handler, true);
 
         // Do a first rl_initialize() before setting any key bindings or config
         // variables.  Otherwise it would happen when rl_module installs the
@@ -2109,7 +2134,6 @@ void initialise_readline(const char* shell_name, const char* state_dir, const ch
         { "\\M-\\C-w",      "clink-copy-word" },         // alt-ctrl-w
         { "\\e[5;5~",       "clink-up-directory" },      // ctrl-pgup (changed in Clink 1.0.0)
         { "\\e[5;7~",       "clink-popup-directories" }, // alt-ctrl-pgup
-        { "\\e\\eOS",       "clink-exit" },              // alt-f4
         { "\\e[1;3H",       "clink-scroll-top" },        // alt-home
         { "\\e[1;3F",       "clink-scroll-bottom" },     // alt-end
         { "\\e[5;3~",       "clink-scroll-page-up" },    // alt-pgup
@@ -2135,7 +2159,8 @@ void initialise_readline(const char* shell_name, const char* state_dir, const ch
         { "\\e[1;6C",       "cua-forward-word" },        // ctrl-shift-right
         { "\\e[1;2H",       "cua-beg-of-line" },         // shift-home
         { "\\e[1;2F",       "cua-end-of-line" },         // shift-end
-        { "\\e[2;2~",       "cua-copy" },                // shift-ins
+        { "\\e[2;5~",       "cua-copy" },                // ctrl-ins
+        { "\\e[2;2~",       "clink-paste" },             // shift-ins
         { "\\e[3;2~",       "cua-cut" },                 // shift-del
         { "\\e[27;2;32~",   "clink-shift-space" },       // shift-space
         // Update default bindings for commands replaced for suggestions.
@@ -2177,6 +2202,17 @@ void initialise_readline(const char* shell_name, const char* state_dir, const ch
     const char* bindableEsc = get_bindable_esc();
     if (bindableEsc)
     {
+        // REVIEW: When not using `terminal.raw_esc`, there's no clean way via
+        // just key bindings to make ESC ESC do completion without interfering
+        // with ESC by itself.  But binding bindableEsc,bindableEsc to
+        // `complete` and unbinding bindableEsc would let ESC ESC do completion
+        // as long as it's ok for ESC by itself to have no effect.
+        // NOTE: When using `terminal.raw_esc`, it's expected that ESC doesn't
+        // do anything by itself (except in vi mode, where there's a hack to
+        // make ESC + timeout drop into vi command mode).
+        rl_unbind_key_in_map(27/*alt-ctrl-[*/, emacs_meta_keymap);
+        rl_unbind_key_in_map(27, vi_insertion_keymap);
+        rl_bind_keyseq_in_map("\\e[27;7;219~"/*alt-ctrl-[*/, rl_named_function("complete"), emacs_standard_keymap);
         rl_bind_keyseq_in_map(bindableEsc, rl_named_function("clink-reset-line"), emacs_standard_keymap);
         rl_bind_keyseq_in_map(bindableEsc, rl_named_function("vi-movement-mode"), vi_insertion_keymap);
     }
@@ -2188,7 +2224,6 @@ void initialise_readline(const char* shell_name, const char* state_dir, const ch
     if (g_default_bindings.get() == 1)
         bind_keyseq_list(windows_emacs_key_binds, emacs_standard_keymap);
 
-    rl_unbind_key_in_map(27, vi_insertion_keymap);
     bind_keyseq_list(general_key_binds, vi_insertion_keymap);
     bind_keyseq_list(general_key_binds, vi_movement_keymap);
     bind_keyseq_list(vi_insertion_key_binds, vi_insertion_keymap);
@@ -2281,6 +2316,8 @@ bool mouse_info::get_anchor(int point, int& anchor, int& pos) const
 //------------------------------------------------------------------------------
 rl_module::rl_module(terminal_in* input)
 : m_prev_group(-1)
+, m_old_int(SIG_DFL)
+, m_old_break(SIG_DFL)
 {
     if (g_debug_log_terminal.get())
     {
@@ -2459,18 +2496,18 @@ bool rl_module::translate(const char* seq, int len, str_base& out)
                 return true;
         }
     }
-    else if (RL_ISSTATE(RL_STATE_ISEARCH|RL_STATE_NSEARCH))
+    else if (RL_ISSTATE(RL_STATE_NSEARCH))
     {
         if (strcmp(seq, bindableEsc) == 0)
         {
-            // These modes have hard-coded handlers that abort on Ctrl+G, so
-            // redirect ESC to Ctrl+G.
+            // Non-incremental search mode has a hard-coded handler that aborts
+            // on Ctrl+G, so redirect ESC to Ctrl+G.
             char tmp[2] = { ABORT_CHAR };
             out = tmp;
             return true;
         }
     }
-    else if (RL_ISSTATE(RL_SIMPLE_INPUT_STATES) ||
+    else if (RL_ISSTATE(RL_SIMPLE_INPUT_STATES|RL_STATE_ISEARCH) ||
              rl_is_insert_next_callback_pending() ||
              win_fn_callback_pending())
     {
@@ -2552,14 +2589,8 @@ void rl_module::set_prompt(const char* prompt, const char* rprompt, bool redispl
         was_visible = show_cursor(false);
         lock_cursor(true);
 
-        // Count the number of lines the prefix takes to display.
-        str_moveable bracketed_prefix;
-        if (rl_get_local_prompt_prefix())
-        {
-            ecma48_processor_flags flags = ecma48_processor_flags::bracket;
-            ecma48_processor(rl_get_local_prompt_prefix(), &bracketed_prefix, nullptr/*cell_count*/, flags);
-        }
-        int lines = count_prompt_lines(bracketed_prefix.c_str(), bracketed_prefix.length());
+        // Count the number of lines the prompt takes to display.
+        int lines = count_prompt_lines(rl_get_local_prompt_prefix());
 
         // Clear the input line and the prompt prefix.
         rl_clear_visible_line();
@@ -2593,10 +2624,7 @@ void rl_module::set_prompt(const char* prompt, const char* rprompt, bool redispl
 //------------------------------------------------------------------------------
 bool rl_module::is_input_pending()
 {
-    return (rl_pending_input ||
-            _rl_pushed_input_available() ||
-            RL_ISSTATE(RL_STATE_MACROINPUT) ||
-            rl_executing_macro);
+    return is_readline_input_pending();
 }
 
 //------------------------------------------------------------------------------
@@ -2631,24 +2659,16 @@ void rl_module::on_begin_line(const context& context)
 {
     const bool log_terminal = g_debug_log_terminal.get();
 
+    m_old_int = signal(SIGINT, clink_sighandler);
+#ifdef SIGBREAK
+    m_old_break = signal(SIGBREAK, clink_sighandler);
+#endif
+    SetConsoleCtrlHandler(clink_ctrlevent_handler, true);
+
     // Readline only detects terminal size changes while its line editor is
     // active.  If the terminal size isn't what Readline thought, then update
     // it now.
-    {
-        CONSOLE_SCREEN_BUFFER_INFO csbi;
-        HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
-        GetConsoleScreenBufferInfo(h, &csbi);
-
-        const int width = csbi.dwSize.X;
-        const int height = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
-
-        if (_rl_screenheight != height || _rl_screenwidth != width)
-        {
-            rl_set_screen_size(height, width);
-            if (log_terminal)
-                LOG("terminal size %u x %u", _rl_screenwidth, _rl_screenheight);
-        }
-    }
+    refresh_terminal_size();
 
     {
         // Remind if logging is on.
@@ -2683,11 +2703,11 @@ void rl_module::on_begin_line(const context& context)
         s_classifications = &context.classifications;
     g_prompt_refilter = g_prompt_redisplay = 0; // Used only by diagnostic output.
 
-    _rl_face_modmark = '*';
+    _rl_face_modmark = FACE_MODMARK;
     _rl_display_modmark_color = build_color_sequence(g_color_modmark, m_modmark_color, true);
 
-    _rl_face_horizscroll = '<';
-    _rl_face_message = '(';
+    _rl_face_horizscroll = FACE_SCROLL;
+    _rl_face_message = FACE_MESSAGE;
     s_input_color = build_color_sequence(g_color_input, m_input_color, true);
     s_selection_color = build_color_sequence(g_color_selection, m_selection_color, true);
     s_arg_color = build_color_sequence(g_color_arg, m_arg_color, true);
@@ -2708,6 +2728,7 @@ void rl_module::on_begin_line(const context& context)
     _rl_arginfo_color = build_color_sequence(g_color_arginfo, m_arginfo_color, true);
     _rl_selected_color = build_color_sequence(g_color_selected, m_selected_color);
     s_suggestion_color = build_color_sequence(g_color_suggestion, m_suggestion_color, true);
+    s_histexpand_color = build_color_sequence(g_color_histexpand, m_histexpand_color, true);
 
     if (!s_selection_color && s_input_color)
     {
@@ -2807,6 +2828,14 @@ void rl_module::on_end_line()
 
     g_rl_buffer = nullptr;
     g_pager = nullptr;
+
+    SetConsoleCtrlHandler(clink_ctrlevent_handler, false);
+#ifdef SIGBREAK
+    signal(SIGBREAK, m_old_break);
+    m_old_break = SIG_DFL;
+#endif
+    signal(SIGINT, m_old_int);
+    m_old_int = SIG_DFL;
 }
 
 //------------------------------------------------------------------------------
@@ -2815,8 +2844,8 @@ bool translate_xy_to_readline(unsigned int x, unsigned int y, int& pos, bool cli
     CONSOLE_SCREEN_BUFFER_INFO csbi;
     GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi);
 
-    int v_pos_y = (csbi.dwCursorPosition.Y - csbi.srWindow.Top);
-    int v_pos = _rl_last_v_pos - v_pos_y + y;
+    const int v_begin_line_y = max<int>(0, csbi.dwCursorPosition.Y - _rl_last_v_pos);
+    int v_pos = y - v_begin_line_y;
 
     if (v_pos < 0)
     {
@@ -2830,6 +2859,8 @@ bool translate_xy_to_readline(unsigned int x, unsigned int y, int& pos, bool cli
             return false;
         v_pos = _rl_vis_botlin;
     }
+
+    v_pos += get_readline_display_top_offset();
 
     const int prefix = rl_get_prompt_prefix_visible();
     int point = 0;
@@ -2951,6 +2982,7 @@ void rl_module::on_input(const input& input, result& result, const context& cont
     {
         virtual void begin() override   {}
         virtual void end() override     {}
+        virtual bool available(unsigned int timeout) override { return false; }
         virtual void select(input_idle*) override {}
         virtual int  read() override    { return *(unsigned char*)(data++); }
         virtual key_tester* set_key_tester(key_tester* keys) override { return nullptr; }
@@ -2964,8 +2996,13 @@ void rl_module::on_input(const input& input, result& result, const context& cont
     s_matches = &context.matches;
 
     // Call Readline's until there's no characters left.
+//#define USE_RESEND_HACK
+#ifdef USE_RESEND_HACK
     int is_inc_searching = rl_readline_state & RL_STATE_ISEARCH;
+#endif
     unsigned int len = input.len;
+    rollback<unsigned int*> rb_input_len_ptr(s_input_len_ptr, &len);
+    rollback<bool> rb_input_more(s_input_more, input.more);
     while (len && !m_done)
     {
         bool is_quoted_insert = rl_is_insert_next_callback_pending();
@@ -3030,6 +3067,7 @@ void rl_module::on_input(const input& input, result& result, const context& cont
 
         // Internally Readline tries to resend escape characters but it doesn't
         // work with how Clink uses Readline. So we do it here instead.
+#ifdef USE_RESEND_HACK
         if (term_in.data[-1] == 0x1b && is_inc_searching)
         {
             assert(!is_quoted_insert);
@@ -3037,15 +3075,7 @@ void rl_module::on_input(const input& input, result& result, const context& cont
             ++len;
             is_inc_searching = 0;
         }
-
-        // Don't end quoted insert on an ESC unless terminal.raw_esc is enabled.
-        if (is_quoted_insert &&
-            !rl_is_insert_next_callback_pending() &&
-            _rl_get_inserted_char() == '\x1b' &&
-            !g_terminal_raw_esc.get())
-        {
-            rl_quoted_insert(1, 0);
-        }
+#endif
     }
 
     g_result = nullptr;
@@ -3091,94 +3121,10 @@ void rl_module::done(const char* line)
 }
 
 //------------------------------------------------------------------------------
-void rl_module::on_terminal_resize(int columns, int rows, const context& context)
+void rl_module::on_terminal_resize(int, int, const context& context)
 {
-    // Windows internally captures various details about output it received in
-    // order to improve its line wrapping behavior.  Those supplemental details
-    // are not available outside conhost itself, so there's no good way for
-    // Clink to predict the actual exact wrapping that will occur.
-    //
-    // So instead Clink uses a simple heuristic that works well most of the
-    // time:  Clink tries to put the cursor on the same row as the original top
-    // line of the input area, so that Readline's rl_resize_terminal() function
-    // can start a new prompt and overwrite the old one.
-
-    int remaining = columns;
-    int line_count = 1;
-
-    auto measure = [&] (const char* input, int length) {
-        ecma48_state state;
-        ecma48_iter iter(input, state, length);
-        while (const ecma48_code& code = iter.next())
-        {
-            switch (code.get_type())
-            {
-            case ecma48_code::type_chars:
-                for (str_iter i(code.get_pointer(), code.get_length()); i.more(); )
-                {
-                    int n = clink_wcwidth(i.next());
-                    remaining -= n;
-                    if (remaining > 0)
-                        continue;
-
-                    ++line_count;
-
-                    remaining = columns - ((remaining < 0) << 1);
-                }
-                break;
-
-            case ecma48_code::type_c0:
-                switch (code.get_code())
-                {
-                case ecma48_code::c0_lf:
-                    ++line_count;
-                    /* fallthrough */
-
-                case ecma48_code::c0_cr:
-                    remaining = columns;
-                    break;
-
-                case ecma48_code::c0_ht:
-                    if (int n = 8 - ((columns - remaining) & 7))
-                        remaining = max(remaining - n, 0);
-                    break;
-
-                case ecma48_code::c0_bs:
-                    remaining = min(remaining + 1, columns); // doesn't consider full-width
-                    break;
-                }
-                break;
-            }
-        }
-    };
-
-    // Measure the new number of lines to the cursor position.
-    measure(context.prompt, -1);
-    line_count = 1; // Keep only the X component from the prompt, since Readline only redisplays the last line of the prompt.
-    const line_buffer& buffer = context.buffer;
-    const char* buffer_ptr = buffer.get_buffer();
-    measure(buffer_ptr, buffer.get_cursor());
-    int cursor_line = line_count - 1;
-    int delta = _rl_last_v_pos - cursor_line;
-
-    // Move cursor to where the top line should be.
-    CONSOLE_SCREEN_BUFFER_INFO csbi;
-    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
-    GetConsoleScreenBufferInfo(h, &csbi);
-    COORD new_pos = { 0, SHORT(clamp(csbi.dwCursorPosition.Y + delta, 0, csbi.dwSize.Y - 1)) };
-    SetConsoleCursorPosition(h, new_pos);
-    if (new_pos.Y < csbi.srWindow.Top)
-        ScrollConsoleRelative(h, new_pos.Y, SCR_ABSOLUTE);
-
-    // Clear to end of screen.
-    static const char* const termcap_cd = tgetstr("cd", nullptr);
-    context.printer.print(termcap_cd, strlen(termcap_cd));
-
-    // Let Readline update its display.
-    rl_resize_terminal();
-
-    if (g_debug_log_terminal.get())
-        LOG("terminal size %u x %u", _rl_screenwidth, _rl_screenheight);
+    signal_terminal_resized();
+    resize_readline_display(context.prompt, context.buffer, m_rl_prompt.c_str(), m_rl_rprompt.c_str());
 }
 
 //------------------------------------------------------------------------------

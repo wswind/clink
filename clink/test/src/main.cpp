@@ -66,6 +66,7 @@ int main(int argc, char** argv)
     os::set_shellname(L"clink_test_harness");
 
     _rl_bell_preference = VISIBLE_BELL;     // Because audible is annoying.
+    _rl_optimize_typeahead = false;         // Because not compatible with READLINE_CALLBACKS.
 
     while (argc > 0)
     {
@@ -102,6 +103,12 @@ int main(int argc, char** argv)
 
     const char* prefix = (argc > 0) ? argv[0] : "";
     int result = (clatch::run(prefix) != true);
+
+    extern void shutdown_recognizer();
+    shutdown_recognizer();
+
+    extern void shutdown_task_manager();
+    shutdown_task_manager();
 
     if (timer)
     {

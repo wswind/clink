@@ -75,7 +75,7 @@ struct matches_impl::match_lookup_comparator
 
 
 //------------------------------------------------------------------------------
-match_type to_match_type(int mode, int attr, const char* path)
+match_type to_match_type(DWORD attr, const char* path, bool symlink)
 {
     static_assert(int(match_type::none) == MATCH_TYPE_NONE, "match_type enum must match readline constants");
     static_assert(int(match_type::word) == MATCH_TYPE_WORD, "match_type enum must match readline constants");
@@ -92,7 +92,7 @@ match_type to_match_type(int mode, int attr, const char* path)
 
     match_type type;
 
-    if (mode & _S_IFDIR)
+    if (attr & FILE_ATTRIBUTE_DIRECTORY)
         type = match_type::dir;
     else
         type = match_type::file;
@@ -102,20 +102,27 @@ match_type to_match_type(int mode, int attr, const char* path)
     if (attr & FILE_ATTRIBUTE_READONLY)
         type |= match_type::readonly;
 
-#ifdef _S_IFLNK
-    if (mode & _S_IFLNK)
-        type |= match_type::link;
-#endif
-
-    if (int(type & match_type::link))
+    if (symlink)
     {
         wstr<288> wfile(path);
         struct _stat64 st;
         if (_wstat64(wfile.c_str(), &st) < 0)
             type |= match_type::orphaned;
+        type |= match_type::link;
     }
 
     return type;
+}
+
+//------------------------------------------------------------------------------
+match_type backcompat_match_type(const char* path)
+{
+    bool symlink;
+    const DWORD attr = os::get_file_attributes(path, &symlink);
+    if (attr == INVALID_FILE_ATTRIBUTES)
+        return match_type::file;
+
+    return to_match_type(attr, path, symlink);
 }
 
 //------------------------------------------------------------------------------
@@ -285,6 +292,12 @@ void match_builder::set_no_sort()
 }
 
 //------------------------------------------------------------------------------
+void match_builder::set_volatile()
+{
+    return ((matches_impl&)m_matches).set_volatile();
+}
+
+//------------------------------------------------------------------------------
 void match_builder::set_deprecated_mode()
 {
     ((matches_impl&)m_matches).set_deprecated_mode();
@@ -348,9 +361,17 @@ std::shared_ptr<match_builder_toolkit> make_match_builder_toolkit(int generation
 
 
 //------------------------------------------------------------------------------
+static char* __tilde_expand(const char* in)
+{
+    str_moveable tmp;
+    path::tilde_expand(in, tmp);
+    return tmp.detach();
+}
+
+//------------------------------------------------------------------------------
 matches_iter::matches_iter(const matches& matches, const char* pattern)
 : m_matches(matches)
-, m_expanded_pattern(pattern && rl_complete_with_tilde_expansion ? tilde_expand(pattern) : nullptr)
+, m_expanded_pattern(pattern && rl_complete_with_tilde_expansion ? __tilde_expand(pattern) : nullptr)
 , m_pattern((m_expanded_pattern ? m_expanded_pattern : pattern),
             (m_expanded_pattern ? m_expanded_pattern : pattern) ? -1 : 0)
 , m_has_pattern(pattern != nullptr)
@@ -778,6 +799,19 @@ bool matches_impl::match_display_filter(const char* needle, char** matches, matc
 }
 
 //------------------------------------------------------------------------------
+bool matches_impl::filter_matches(char** matches, char completion_type, bool filename_completion_desired) const
+{
+    // TODO:  This doesn't really belong here.  But it's a convenient point to
+    // cobble together Lua (via the generators) and the matches.  It's strange
+    // to pass 'matches' into matches_impl, but the caller already has it and
+    // this way we don't have to figure out how to reproduce 'matches'
+    // accurately (it might have been produced by a pattern iterator) in order
+    // to generate an array to pass to onfiltermatches event callbacks.
+
+    return m_generator && m_generator->filter_matches(matches, completion_type, filename_completion_desired);
+}
+
+//------------------------------------------------------------------------------
 void matches_impl::reset()
 {
     delete m_dedup;
@@ -786,13 +820,14 @@ void matches_impl::reset()
     m_store.reset();
     m_infos.clear();
     m_count = 0;
-    m_any_infer_type = false;
-    m_can_infer_type = true;
+    m_any_none_type = false;
+    m_deprecated_mode = false;
     m_coalesced = false;
     m_append_character = '\0';
     m_suppress_append = false;
     m_regen_blocked = false;
     m_nosort = false;
+    m_volatile = false;
     m_suppress_quoting = 0;
     m_word_break_position = -1;
     m_filename_completion_desired.reset();
@@ -810,13 +845,14 @@ void matches_impl::transfer(matches_impl& from)
     m_store = std::move(from.m_store);
     m_infos = std::move(from.m_infos);
     m_count = from.m_count;
-    m_any_infer_type = from.m_any_infer_type;
-    m_can_infer_type = from.m_can_infer_type;
+    m_any_none_type = from.m_any_none_type;
+    m_deprecated_mode = from.m_deprecated_mode;
     m_coalesced = from.m_coalesced;
     m_append_character = from.m_append_character;
     m_suppress_append = from.m_suppress_append;
     m_regen_blocked = from.m_regen_blocked;
     m_nosort = from.m_nosort;
+    m_volatile = from.m_volatile;
     m_suppress_quoting = from.m_suppress_quoting;
     m_word_break_position = from.m_word_break_position;
     m_filename_completion_desired = from.m_filename_completion_desired;
@@ -867,7 +903,7 @@ void matches_impl::set_regen_blocked()
 //------------------------------------------------------------------------------
 void matches_impl::set_deprecated_mode()
 {
-    m_can_infer_type = false;
+    m_deprecated_mode = true;
 }
 
 //------------------------------------------------------------------------------
@@ -881,6 +917,12 @@ void matches_impl::set_matches_are_files(bool files)
 void matches_impl::set_no_sort()
 {
     m_nosort = true;
+}
+
+//------------------------------------------------------------------------------
+void matches_impl::set_volatile()
+{
+    m_volatile = true;
 }
 
 //------------------------------------------------------------------------------
@@ -964,7 +1006,8 @@ bool matches_impl::add_match(const match_desc& desc, bool already_normalized)
         assert(tmp.length() > 0);
         assert(strcmp(store_match, tmp.c_str()) == 0);
         const_cast<char*>(store_match)[tmp.length() - 1] = '\0';
-        m_any_infer_type = true;
+        if (is_none)
+            m_any_none_type = true;
     }
 
     const char* store_display = (desc.display && *desc.display) ? m_store.store_front(desc.display) : nullptr;
@@ -975,7 +1018,7 @@ bool matches_impl::add_match(const match_desc& desc, bool already_normalized)
     m_dedup->emplace(std::move(lookup));
 
     unsigned int ordinal = static_cast<unsigned int>(m_infos.size());
-    match_info info = { store_match, store_display, store_description, ordinal, type, desc.append_char, desc.suppress_append, append_display, false/*select*/, is_none/*infer_type*/ };
+    match_info info = { store_match, store_display, store_description, ordinal, type, desc.append_char, desc.suppress_append, append_display, false/*select*/ };
     m_infos.emplace_back(std::move(info));
     ++m_count;
 
@@ -994,8 +1037,9 @@ void matches_impl::done_building()
     // If there were any `none` type matches and file completion has not been
     // explicitly disabled, then it's necessary to post-process the matches to
     // identify which are directories, or files, or neither.
-    if (m_any_infer_type && (m_filename_completion_desired.get() ||
-                             (m_can_infer_type && !m_filename_completion_desired.is_explicit())))
+    if (m_any_none_type && (m_deprecated_mode ?
+                            (m_filename_completion_desired.get() && m_filename_completion_desired.is_explicit()) :
+                            (m_filename_completion_desired.get() || !m_filename_completion_desired.is_explicit())))
     {
         char sep = rl_preferred_path_separator;
         if (s_slash_translation == 2)
@@ -1005,38 +1049,27 @@ void matches_impl::done_building()
 
         for (unsigned int i = m_count; i--;)
         {
-            if (m_infos[i].infer_type)
+            if (is_match_type(m_infos[i].type, match_type::none))
             {
                 // If matches are relative, but not relative to the current
                 // directory, then get_path_type() might yield unexpected
                 // results.  But that will interfere with many things, so no
                 // effort is invested here to compensate.
                 match_lookup lookup = { m_infos[i].match, m_infos[i].type };
-                switch (os::get_path_type(m_infos[i].match))
+
+                // Remove it from the dup map before modifying it.
+                m_dedup->erase(lookup);
+
+                // Apply backward compatibility logic to the match type.
+                lookup.type = backcompat_match_type(lookup.match);
+                m_infos[i].type = lookup.type;
+
+                // If it's a directory, add a trailing path separator.
+                if (is_match_type(lookup.type, match_type::dir))
                 {
-                case os::path_type_dir:
-                    {
-                        // Remove it from the dup map before modifying it.
-                        m_dedup->erase(lookup);
-                        // It's a directory, so update the type and add a
-                        // trailing path separator.
-                        const size_t len = strlen(m_infos[i].match);
-                        const_cast<char*>(m_infos[i].match)[len] = sep;
-                        m_infos[i].type |= match_type::dir;
-                        assert(m_infos[i].match[len + 1] == '\0');
-                    }
-                    break;
-                case os::path_type_file:
-                    {
-                        // Remove it from the dup map before modifying it.
-                        m_dedup->erase(lookup);
-                        // It's a file, so update the type.
-                        lookup.type |= match_type::file;
-                        m_infos[i].type |= lookup.type;
-                    }
-                    break;
-                default:
-                    continue;
+                    const size_t len = strlen(m_infos[i].match);
+                    const_cast<char*>(m_infos[i].match)[len] = sep;
+                    assert(m_infos[i].match[len + 1] == '\0');
                 }
 
                 // Check if it has become a duplicate.

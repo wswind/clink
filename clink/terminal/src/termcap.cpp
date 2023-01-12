@@ -48,7 +48,8 @@ extern "C" int show_cursor(int visible)
 
         // Windows Terminal doesn't support using SetConsoleCursorInfo to change
         // the cursor size, so use termcap strings instead.
-        if (get_native_ansi_handler() == ansi_handler::winterminal)
+        if (get_native_ansi_handler() == ansi_handler::winterminal ||
+            get_native_ansi_handler() == ansi_handler::wezterm)
         {
             if (!str[0])
             {
@@ -371,10 +372,17 @@ char* tgetstr(const char* name, char** out)
     case 'ch': str = CSI(%dG); break;
     case 'cr': str = "\x0d"; break;
     case 'le': str = "\x08"; break;
+    case 'LE': str = CSI(%dD); break;
     case 'nd': str = CSI(C); break;
+    case 'ND': str = CSI(%dC); break;
     case 'up': str = CSI(A); break;
+    case 'UP': str = CSI(%dA); break;
 
-    // Cursor style
+    // Saved cursor position.
+    case 'sc': str = CSI(s); break;
+    case 'rc': str = CSI(u); break;
+
+    // Cursor style.
     case 've': str = c_default_term_ve; break;
     case 'vs': str = c_default_term_vs; break;
 
@@ -395,7 +403,7 @@ char* tgetstr(const char* name, char** out)
 }
 
 //------------------------------------------------------------------------------
-char* tgoto(char* base, int x, int y)
+char* tgoto(const char* base, int x, int y)
 {
     str_base(gt_termcap_buffer).format(base, y);
     return gt_termcap_buffer;

@@ -2,7 +2,6 @@
 // License: http://opensource.org/licenses/MIT
 
 #include "pch.h"
-#include "history/history_db.h"
 #include "utils/app_context.h"
 
 #include <core/base.h>
@@ -10,20 +9,27 @@
 #include <core/settings.h>
 #include <core/str.h>
 #include <core/str_tokeniser.h>
+#include <lib/history_db.h>
 
 #include <getopt.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctime>
 #include <assert.h>
 
 //------------------------------------------------------------------------------
 extern setting_bool g_save_history;
+extern setting_enum g_history_timestamp;
+extern setting_str g_history_timeformat;
 
 //------------------------------------------------------------------------------
+extern "C" unsigned int cell_count(const char* in);
 void puts_help(const char* const* help_pairs, const char* const* other_pairs=nullptr);
 
 //------------------------------------------------------------------------------
 static bool s_diag = false;
+static bool s_showtime = false;
+static str_moveable s_timeformat;
 
 //------------------------------------------------------------------------------
 class history_scope
@@ -42,12 +48,24 @@ private:
 history_scope::history_scope()
 {
     // Load settings.
-    str<288> default_settings_file;
-    app_context::get()->get_settings_path(m_path);
-    app_context::get()->get_default_settings_file(default_settings_file);
+    str<> history_path;
+    str<> default_settings_file;
+    auto app = app_context::get();
+    app->get_settings_path(m_path);
+    app->get_history_path(history_path);
+    app->get_default_settings_file(default_settings_file);
     settings::load(m_path.c_str(), default_settings_file.c_str());
 
-    m_history = new history_db(g_save_history.get());
+    if (g_history_timestamp.get() == 2)
+        s_showtime = true;
+    if (s_timeformat.empty())
+    {
+        g_history_timeformat.get(s_timeformat);
+        if (s_timeformat.empty())
+            s_timeformat = "F% T%  ";
+    }
+
+    m_history = new history_db(history_path.c_str(), app->get_id(), g_save_history.get());
 
     if (s_diag)
         m_history->enable_diagnostic_output();
@@ -80,7 +98,7 @@ static void print_history_item(HANDLE hout, const char* utf8, wstr_base* utf16)
         for (const char* walk = utf8; *walk;)
         {
             const char* begin = walk;
-            while (*walk >= 0x20 || *walk == 0x09)
+            while (static_cast<unsigned char>(*walk) >= 0x20 || *walk == 0x09)
                 walk++;
             if (walk > begin)
             {
@@ -127,13 +145,30 @@ static void print_history(unsigned int tail_count, bool bare)
 
     for (unsigned int i = 0; i < skip; ++i, ++index, iter.next(line));
 
+    char timebuf[128];
     str<> utf8;
     wstr<> utf16;
     HANDLE hout = GetStdHandle(STD_OUTPUT_HANDLE);
     bool translate = is_console(hout);
 
+    unsigned int timelen = 0;
+    struct tm tm = {};
+    if (s_showtime)
+    {
+        tm.tm_year = 2001;
+        tm.tm_mon = 11;
+        tm.tm_mday = 15;
+        tm.tm_hour = 23;
+        tm.tm_min = 30;
+        tm.tm_sec = 30;
+        timebuf[0] = '\0';
+        strftime(timebuf, sizeof_array(timebuf), s_timeformat.c_str(), &tm);
+        timelen = cell_count(timebuf);
+    }
+
+    str<32> timestamp;
     unsigned int num_from[2] = {};
-    for (; iter.next(line); ++index)
+    for (; iter.next(line, &timestamp); ++index)
     {
         if (s_diag)
         {
@@ -144,8 +179,19 @@ static void print_history(unsigned int tail_count, bool bare)
         utf8.clear();
         if (bare)
             utf8.format("%.*s", line.length(), line.get_pointer());
-        else
+        else if (!s_showtime)
             utf8.format("%5u  %.*s", index, line.length(), line.get_pointer());
+        else
+        {
+            timebuf[0] = '\0';
+            if (!timestamp.empty())
+            {
+                const time_t tt = time_t(atoi(timestamp.c_str()));
+                if (localtime_s(&tm, &tt) == 0)
+                    strftime(timebuf, sizeof_array(timebuf), s_timeformat.c_str(), &tm);
+            }
+            utf8.format("%5u  %-*s%.*s", index, timelen, timebuf, line.length(), line.get_pointer());
+        }
 
         print_history_item(hout, utf8.c_str(), translate ? &utf16 : nullptr);
     }
@@ -264,19 +310,21 @@ static int print_help()
     extern void puts_clink_header();
 
     static const char* const help_verbs[] = {
-        "[n]",          "Print history items (only the last N items if specified).",
-        "clear",        "Completely clears the command history.",
-        "compact [n]",  "Compacts the history file.",
-        "delete <n>",   "Delete Nth item (negative N indexes history backwards).",
-        "add <...>",    "Join remaining arguments and appends to the history.",
-        "expand <...>", "Print substitution result.",
+        "[n]",           "Print history items (only the last N items if specified).",
+        "clear",         "Completely clears the command history.",
+        "compact [n]",   "Compacts the history file.",
+        "delete <n>",    "Delete Nth item (negative N indexes history backwards).",
+        "add <...>",     "Join remaining arguments and appends to the history.",
+        "expand <...>",  "Print substitution result.",
         nullptr
     };
 
     static const char* const help_options[] = {
-        "--bare",       "Omit item numbers when printing history.",
-        "--diag",       "Print diagnostic info to stderr.",
-        "--unique",     "Remove duplicates when compacting history.",
+        "--bare",        "Omit item numbers when printing history.",
+        "--diag",        "Print diagnostic info to stderr.",
+        "--show-time",   "Show history item timestamps, if any.",
+        "--time-format", "Override the format string for showing timestamps.",
+        "--unique",      "Remove duplicates when compacting history.",
         nullptr
     };
 
@@ -380,17 +428,25 @@ int history(int argc, char** argv)
         if (is_flag(argv[i], "--help", 3) || is_flag(argv[i], "-h"))
             return print_help();
 
-        bool remove = true;
+        int remove = 1;
         if (is_flag(argv[i], "--bare", 3))
             bare = true;
         else if (is_flag(argv[i], "--diag", 3))
             s_diag = true;
         else if (is_flag(argv[i], "--unique", 3))
             uniq = true;
+        else if (is_flag(argv[i], "--show-time", 3))
+            s_showtime = true;
+        else if (is_flag(argv[i], "--time-format", 3))
+        {
+            s_showtime = true;
+            s_timeformat = argv[++i];
+            remove++;
+        }
         else
-            remove = false;
+            remove = 0;
 
-        if (remove)
+        while (remove--)
         {
             for (int j = i; j < argc; ++j)
                 argv[j] = argv[j + 1];

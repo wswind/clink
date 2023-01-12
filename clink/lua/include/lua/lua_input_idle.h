@@ -18,15 +18,21 @@ public:
     unsigned        get_timeout() override;
     void*           get_waitevent() override;
     void            on_idle() override;
+    void            on_task_manager() override;
 
     void            kick();
+
+    static void     signal_delayed_init();
+    static void     signal_reclassify();
 
 private:
     bool            is_enabled();
     bool            has_coroutines();
     void            resume_coroutines();
     lua_state&      m_state;
-    void*           m_event = 0;
     unsigned        m_iterations = 0;
     bool            m_enabled = true;
+
+    static bool     s_signaled_delayed_init;
+    static bool     s_signaled_reclassify;
 };

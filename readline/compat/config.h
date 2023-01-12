@@ -22,6 +22,7 @@
 #if defined(BUILD_READLINE) && !defined(__cplusplus)
 #include "../../clink/core/include/core/bldopts.h"
 #include "../../clink/core/include/core/debugheap.h"
+#include <assert.h>
 #endif
 
 int     compare_string(const char* s1, const char* s2, int casefold);
@@ -169,7 +170,7 @@ extern wcswidth_t *wcswidth;
 /* #undef HAVE_FCNTL */
 
 /* Define if you have the fnmatch function. */
-/* #undef HAVE_FNMATCH */
+#define HAVE_FNMATCH 1
 
 /* Define if you have the getpwent function. */
 /* #undef HAVE_GETPWENT */

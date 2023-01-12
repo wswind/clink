@@ -124,6 +124,12 @@ static void shutdown_clink()
         g_host = nullptr;
     }
 
+    extern void shutdown_task_manager();
+    shutdown_task_manager();
+
+    extern void shutdown_recognizer();
+    shutdown_recognizer();
+
     if (logger* logger = logger::get())
         delete logger;
 
@@ -175,13 +181,10 @@ void start_logger()
                     ver.dwMajorVersion,
                     ver.dwMinorVersion,
                     ver.dwBuildNumber,
-                    (system_info.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64) ? "x64" : "x86");
+                    (system_info.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64) ? "x64" : 
+                    ((system_info.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_ARM64) ? "arm64" : "x86"));
             }
-#ifdef _WIN64
-            LOG("Clink version %s (x64)", CLINK_VERSION_STR);
-#else
-            LOG("Clink version %s (x86)", CLINK_VERSION_STR);
-#endif
+            LOG("Clink version %s (%s)", CLINK_VERSION_STR, AS_STR(ARCHITECTURE_NAME));
 #pragma warning(pop)
         }
     }

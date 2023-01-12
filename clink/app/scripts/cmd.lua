@@ -20,7 +20,7 @@ local cmd_commands = {
 }
 
 --------------------------------------------------------------------------------
-function cmd_generator:generate(line_state, match_builder)
+function cmd_generator:generate(line_state, match_builder) -- luacheck: no self
     -- Cmd commands only apply for the first word of a line.
     if line_state:getwordcount() > 1 then
         return false
@@ -31,12 +31,16 @@ function cmd_generator:generate(line_state, match_builder)
         return false
     end
 
-    -- They should be skipped if the the line's whitespace prefixed.
+    -- Cmd commands cannot be quoted.
+    local word_info = line_state:getwordinfo(1)
+    if word_info.quoted then
+        return false
+    end
+
+    -- They should be skipped if the line's whitespace prefixed.
     if settings.get("exec.space_prefix") then
-        local word_info = line_state:getwordinfo(1)
         local offset = line_state:getcommandoffset()
-        if word_info.quoted then offset = offset + 1 end
-        if word_info.offset > offset then
+        if line_state:getline():sub(offset, offset):find("[ \t]") then
             return false
         end
     end
@@ -54,7 +58,7 @@ end
 
 --------------------------------------------------------------------------------
 local cmd_classifier = clink.classifier(1)
-function cmd_classifier:classify(commands)
+function cmd_classifier:classify(commands) -- luacheck: no self
     if commands and commands[1] then
         -- Command separators and redirection symbols.
         local line_state = commands[1].line_state
@@ -70,7 +74,7 @@ function cmd_classifier:classify(commands)
                 i = i + 1
             elseif c == '"' then
                 quote = not quote
-            elseif quote then
+            elseif quote then -- luacheck: ignore 542
             elseif c == '&' or c == '|' then
                 classifications:applycolor(i, 1, color_cmdsep)
             elseif c == '>' or c == '<' then
@@ -86,10 +90,10 @@ function cmd_classifier:classify(commands)
         -- Special case coloring for rem command.
         for _,command in pairs(commands) do
             line_state = command.line_state
-            for i = 1, line_state:getwordcount(), 1 do
-                local info = line_state:getwordinfo(i)
+            for word_index = 1, line_state:getwordcount(), 1 do
+                local info = line_state:getwordinfo(word_index)
                 if not info.redir then
-                    if line_state:getword(i) == "rem" then
+                    if line_state:getword(word_index) == "rem" then
                         local color = settings.get("color.description")
                         if color == "" then
                             color = "0"
@@ -104,8 +108,10 @@ function cmd_classifier:classify(commands)
     end
 end
 
+local chain = clink.argmatcher():chaincommand()
+
 local onoff = clink.argmatcher():addarg("ON", "OFF")
 clink.argmatcher("cmd")
-:addflags("/c", "/k", "/s", "/q", "/d", "/a", "/u")
+:addflags("/c"..chain, "/k"..chain, "/s", "/q", "/d", "/a", "/u")
 :addflags("/t:"..clink.argmatcher():addarg({fromhistory=true}), "/e:"..onoff, "/f:"..onoff, "/v:"..onoff)
-:chaincommand()
+:nofiles()

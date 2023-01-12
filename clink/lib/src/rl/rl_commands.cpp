@@ -10,6 +10,8 @@
 #include "rl_commands.h"
 #include "doskey.h"
 #include "textlist_impl.h"
+#include "history_db.h"
+#include "ellipsify.h"
 
 #include "rl_suggestions.h"
 
@@ -66,15 +68,6 @@ static setting_enum g_paste_crlf(
     "delete,space,ampersand,crlf",
     paste_crlf_crlf);
 
-setting_bool g_gui_popups(
-    "clink.gui_popups",
-    "Use GUI popup windows",
-    "Enable this to use GUI popup windows for various commands in Clink.  Clink\n"
-    "defaults to using popup console text, but GUI popup windows can be used for\n"
-    "some popup commands.  The 'color.popup' settings have no effect on GUI popup\n"
-    "windows.",
-    false);
-
 extern setting_bool g_adjust_cursor_style;
 extern setting_color g_color_popup;
 extern setting_color g_color_popup_desc;
@@ -89,18 +82,66 @@ extern line_buffer* g_rl_buffer;
 extern word_collector* g_word_collector;
 extern editor_module::result* g_result;
 extern void host_cmd_enqueue_lines(std::list<str_moveable>& lines, bool hide_prompt, bool show_line);
-extern int host_add_history(int, const char* line);
 extern void host_get_app_context(int& id, str_base& binaries, str_base& profile, str_base& scripts);
 extern "C" int show_cursor(int visible);
-extern int ellipsify(const char* in, int limit, str_base& out, bool expand_ctrl);
 extern void set_suggestion(const char* line, unsigned int endword_offset, const char* suggestion, unsigned int offset);
 extern "C" void host_clear_suggestion();
+extern "C" int test_ambiguous_width_char(char32_t ucs);
 
 // This is implemented in the app layer, which makes it inaccessible to lower
 // layers.  But Readline and History are siblings, so history_db and rl_module
 // and rl_commands should be siblings.  That's a lot of reshuffling for little
 // benefit, so just use a forward decl for now.
 extern bool expand_history(const char* in, str_base& out);
+
+//------------------------------------------------------------------------------
+static UINT s_dwCtrlWakeupMask = 0;
+void set_ctrl_wakeup_mask(UINT mask)
+{
+    s_dwCtrlWakeupMask = mask;
+}
+
+//------------------------------------------------------------------------------
+template<class T> void strip_wakeup_chars_worker(T* chars, unsigned int max_chars)
+{
+    if (!max_chars)
+        return;
+
+    T* read = chars;
+    T* write = chars;
+
+    while (max_chars--)
+    {
+        const T c = *read;
+        if (!c)
+            break;
+
+        if (c < 0 || c >= 32 || !(s_dwCtrlWakeupMask & 1 << c))
+        {
+            if (write != read)
+                *write = c;
+            ++write;
+        }
+
+        ++read;
+    }
+
+    if (write != read)
+        *write = '\0';
+}
+
+//------------------------------------------------------------------------------
+void strip_wakeup_chars(wchar_t* chars, unsigned int max_chars)
+{
+    strip_wakeup_chars_worker(chars, max_chars);
+}
+
+//------------------------------------------------------------------------------
+void strip_wakeup_chars(str_base& out)
+{
+    unsigned int max_chars = out.length();
+    strip_wakeup_chars_worker(out.data(), max_chars);
+}
 
 //------------------------------------------------------------------------------
 static void strip_crlf(char* line, std::list<str_moveable>& overflow, int setting, bool* _done)
@@ -232,6 +273,22 @@ static void get_word_bounds(const line_buffer& buffer, int* left, int* right)
 
 
 //------------------------------------------------------------------------------
+int host_add_history(int, const char* line)
+{
+    history_database* h = history_database::get();
+    return h && h->add(line);
+}
+
+//------------------------------------------------------------------------------
+int host_remove_history(int rl_history_index, const char* line)
+{
+    history_database* h = history_database::get();
+    return h && h->remove(rl_history_index, line);
+}
+
+
+
+//------------------------------------------------------------------------------
 static int s_cua_anchor = -1;
 
 //------------------------------------------------------------------------------
@@ -334,6 +391,7 @@ int clink_paste(int count, int invoking_key)
     bool sel = (s_cua_anchor >= 0);
     std::list<str_moveable> overflow;
     strip_crlf(utf8.data(), overflow, g_paste_crlf.get(), &done);
+    strip_wakeup_chars(utf8);
     if (sel)
     {
         g_rl_buffer->begin_undo_group();
@@ -692,7 +750,6 @@ int clink_selectall_conhost(int count, int invoking_key)
 
 //------------------------------------------------------------------------------
 extern const char** host_copy_dir_history(int* total);
-extern popup_results activate_directories_text_list(const char** dirs, int count);
 int clink_popup_directories(int count, int invoking_key)
 {
     // Copy the directory list (just a shallow copy of the dir pointers).
@@ -706,22 +763,7 @@ int clink_popup_directories(int count, int invoking_key)
     }
 
     // Popup list.
-    popup_results results;
-    if (!g_gui_popups.get())
-    {
-        results = activate_directories_text_list(history, total);
-    }
-    else
-    {
-        const char* choice;
-        int current = total - 1;
-        results.m_result = do_popup_list("Directories",
-            (const char **)history, total, 0,
-            false/*completing*/, false/*auto_complete*/, false/*reverse_find*/,
-            current, choice);
-        results.m_index = current;
-        results.m_text = choice;
-    }
+    const popup_results results = activate_directories_text_list(history, total);
 
     // Handle results.
     switch (results.m_result)
@@ -1374,7 +1416,7 @@ int win_f1(int count, int invoking_key)
 {
     const bool had_selection = (cua_get_anchor() >= 0);
 
-    if (insert_suggestion(suggestion_action::insert_to_end))
+    if (insert_suggestion(suggestion_action::insert_to_end) || accepted_whole_suggestion())
         return 0;
 
     if (count <= 0)
@@ -1612,7 +1654,7 @@ ding:
         history[i] = p ? p : "";
     }
 
-    const popup_results results = activate_history_text_list(history, history_length, min<int>(where_history(), history_length - 1), nullptr, 2);
+    const popup_results results = activate_history_text_list(history, history_length, min<int>(where_history(), history_length - 1), nullptr, true/*win_history*/);
 
     switch (results.m_result)
     {
@@ -1861,7 +1903,7 @@ LUnlinkFile:
     // Save and reset console state.
     HANDLE std_handles[2] = { GetStdHandle(STD_INPUT_HANDLE), GetStdHandle(STD_OUTPUT_HANDLE) };
     DWORD prev_mode[2];
-    static_assert(_countof(std_handles) == _countof(prev_mode), "array sizes much match");
+    static_assert(_countof(std_handles) == _countof(prev_mode), "array sizes must match");
     for (size_t i = 0; i < _countof(std_handles); ++i)
         GetConsoleMode(std_handles[i], &prev_mode[i]);
     SetConsoleMode(std_handles[0], (prev_mode[0] | ENABLE_PROCESSED_INPUT) & ~(ENABLE_WINDOW_INPUT|ENABLE_MOUSE_INPUT));
@@ -1915,6 +1957,7 @@ LUnlinkFile:
     // Split into multiple lines.
     std::list<str_moveable> overflow;
     strip_crlf(line.data(), overflow, paste_crlf_crlf, nullptr);
+    strip_wakeup_chars(line);
 
     // Replace the input line with the content from the temp file.
     g_rl_buffer->begin_undo_group();
@@ -1958,6 +2001,58 @@ int magic_space(int count, int invoking_key)
 
 
 //------------------------------------------------------------------------------
+static void list_ambiguous_codepoints(const char* tag, const std::vector<char32_t>& chars)
+{
+    str<> s;
+    str<> hex;
+    bool first = true;
+
+    s << "  " << tag << ":\n        ";
+    for (char32_t c : chars)
+    {
+        if (first)
+            first = false;
+        else
+            s << ", ";
+        hex.format("\x1b[1;31;40m0x%X\x1b[m", c);
+        s.concat(hex.c_str(), hex.length());
+    }
+    s << "\n";
+
+    g_printer->print(s.c_str(), s.length());
+}
+
+//------------------------------------------------------------------------------
+static void analyze_char_widths(const char* s,
+                                std::vector<char32_t>& cjk,
+                                std::vector<char32_t>& emoji,
+                                std::vector<char32_t>& qualified)
+{
+    if (!s)
+        return;
+
+    bool ignoring = false;
+    str_iter iter(s);
+    while (int c = iter.next())
+    {
+        if (c == RL_PROMPT_START_IGNORE && !ignoring)
+            ignoring = true;
+        else if (c == RL_PROMPT_END_IGNORE && ignoring)
+            ignoring = false;
+        else if (!ignoring)
+        {
+            const int kind = test_ambiguous_width_char(c);
+            switch (kind)
+            {
+            case 1: cjk.push_back(c); break;
+            case 2: emoji.push_back(c); break;
+            case 3: qualified.push_back(c); break;
+            }
+        }
+    }
+}
+
+//------------------------------------------------------------------------------
 int clink_diagnostics(int count, int invoking_key)
 {
     end_prompt(true/*crlf*/);
@@ -1990,7 +2085,7 @@ int clink_diagnostics(int count, int invoking_key)
     if (rl_explicit_arg)
     {
         s.clear();
-        s.format("  %-*s  %s\n", spacing, "architecture", "x" AS_STR(ARCHITECTURE));
+        s.format("  %-*s  %s\n", spacing, "architecture", AS_STR(ARCHITECTURE_NAME));
         g_printer->print(s.c_str(), s.length());
     }
 
@@ -2029,6 +2124,7 @@ int clink_diagnostics(int count, int invoking_key)
         case ansi_handler::conemu:          term = "ConEmu"; break;
         case ansi_handler::ansicon:         term = "ANSICON"; break;
         case ansi_handler::winterminal:     term = "Windows Terminal"; break;
+        case ansi_handler::wezterm:         term = "WezTerm"; break;
         case ansi_handler::winconsolev2:    term = "Console V2 (with 24 bit color)"; break;
         case ansi_handler::winconsole:      term = "Default console (16 bit color only)"; break;
         }
@@ -2038,6 +2134,60 @@ int clink_diagnostics(int count, int invoking_key)
     }
 
     host_call_lua_rl_global_function("clink._diagnostics");
+
+    // Check for known potential ambiguous character width issues.
+
+    {
+        const char* prompt = strrchr(rl_display_prompt, '\n');
+        if (!prompt)
+            prompt = rl_display_prompt;
+        else
+            prompt++;
+
+        std::vector<char32_t> cjk;
+        std::vector<char32_t> emoji;
+        std::vector<char32_t> qualified;
+
+        analyze_char_widths(prompt, cjk, emoji, qualified);
+        analyze_char_widths(rl_rprompt, cjk, emoji, qualified);
+
+        if (cjk.size() || emoji.size() || qualified.size())
+        {
+            s.clear();
+            s << bold << "ambiguous width characters in prompt:" << norm << lf;
+            g_printer->print(s.c_str(), s.length());
+
+            if (cjk.size())
+            {
+                list_ambiguous_codepoints("CJK ambiguous characters", cjk);
+                puts("    Running 'chcp 65001' can often fix width problems with these.\n"
+                     "    Or you can use a different character.");
+            }
+
+            if (emoji.size())
+            {
+                list_ambiguous_codepoints("color emoji", emoji);
+                puts("    To fix problems with these, try using a different symbol or a different\n"
+                     "    terminal program.  Or sometimes using a different font can help.");
+            }
+
+            if (qualified.size())
+            {
+                list_ambiguous_codepoints("qualified emoji", qualified);
+                puts("    To fix problems with these, try using a different symbol or a different\n"
+                     "    terminal program.  Or sometimes using a different font can help.");
+                puts("    The fully-qualified forms of these symbols often encounter problems,\n"
+                     "    but the unqualified forms often work.  For a table of emoji and their\n"
+                     "    forms see https://www.unicode.org/Public/emoji/15.0/emoji-test.txt");
+            }
+        }
+    }
+
+    extern void task_manager_diagnostics();
+    task_manager_diagnostics();
+
+    if (!rl_explicit_arg)
+        g_printer->print("\n(Use a numeric argument for additional diagnostics; e.g. press Alt+1 first.)\n");
 
     rl_forced_update_display();
     return 0;
@@ -2063,7 +2213,7 @@ int macro_hook_func(const char* macro)
 
         HANDLE std_handles[2] = { GetStdHandle(STD_INPUT_HANDLE), GetStdHandle(STD_OUTPUT_HANDLE) };
         DWORD prev_mode[2];
-        static_assert(_countof(std_handles) == _countof(prev_mode), "array sizes much match");
+        static_assert(_countof(std_handles) == _countof(prev_mode), "array sizes must match");
         for (size_t i = 0; i < _countof(std_handles); ++i)
             GetConsoleMode(std_handles[i], &prev_mode[i]);
 
@@ -2104,5 +2254,6 @@ int force_reload_scripts()
     s_force_reload_scripts = true;
     if (g_result)
         g_result->done(true); // Force a new edit line so scripts can be reloaded.
+    readline_internal_teardown(true);
     return rl_re_read_init_file(0, 0);
 }

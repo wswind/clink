@@ -26,12 +26,22 @@
 #endif
 
 #if defined(_M_AMD64) || defined(__x86_64__)
-#   define ARCHITECTURE     64
+#   define ARCHITECTURE         64
+#   define ARCHITECTURE_NAME    x64
+#   define ARCHITECTURE_x64     1
 #elif defined(_M_IX86) || defined(__i386)
-#   define ARCHITECTURE     86
+#   define ARCHITECTURE         86
+#   define ARCHITECTURE_NAME    x86
+#   define ARCHITECTURE_x86     1
+#elif defined(_M_ARM64) || defined(__aarch64__)
+#   define ARCHITECTURE         64
+#   define ARCHITECTURE_NAME    arm64
+#   define ARCHITECTURE_arm64   1
 #else
 #   error Unknown architecture
 #endif
+
+#define ARCHITECTURE_IS(x)    ARCHITECTURE_##x
 
 #undef min
 template <class A> A min(A a, A b) { return (a < b) ? a : b; }
@@ -45,8 +55,10 @@ template <class A> A clamp(A v, A m, A M) { return min(max(v, m), M); }
 //------------------------------------------------------------------------------
 #if defined(PLATFORM_WINDOWS)
 #   define PATH_SEP "\\"
+#   define PATH_SEP_CHAR '\\'
 #else
 #   define PATH_SEP "/"
+#   define PATH_SEP_CHAR '/'
 #endif
 
 //------------------------------------------------------------------------------
@@ -65,10 +77,23 @@ extern const char* get_bindable_esc();
 
 //------------------------------------------------------------------------------
 #if defined(DEBUG)
-int dbg_get_env_int(const char* name);
+int dbg_get_env_int(const char* name, int default_value=0);
 void dbg_printf_row(int row, const char* fmt, ...);
 void dbg_printf(const char* fmt, ...);
 #endif
+
+//------------------------------------------------------------------------------
+#undef assertimplies
+#ifdef NDEBUG
+#define assertimplies(a, b) ((void)0)
+#else
+#define makeassertimpliestext3(x, y, z) x y z
+#define makeassertimpliestext(a, b) makeassertimpliestext3(_CRT_WIDE(#a), _CRT_WIDE(" IMPLIES "), _CRT_WIDE(#b))
+#define assertimplies(a, b) ((void)(    \
+        (!(a) || !!(b)) ||              \
+        (_wassert(makeassertimpliestext(a, b), _CRT_WIDE(__FILE__), (unsigned)(__LINE__)), 0)))
+#endif
+
 
 //------------------------------------------------------------------------------
 struct no_copy

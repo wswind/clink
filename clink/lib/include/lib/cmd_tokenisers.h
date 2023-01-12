@@ -6,7 +6,7 @@
 #include "word_collector.h"
 
 //------------------------------------------------------------------------------
-enum tokeniser_state;
+enum tokeniser_state : int;
 
 //------------------------------------------------------------------------------
 enum state_flag
@@ -24,6 +24,7 @@ public:
     void clear();
     void next_word();
     bool test(int c, tokeniser_state new_state);
+    bool is_first() const { return m_first; }
     void cancel() { m_failed = true; }
 private:
     str<16> m_word;
@@ -42,7 +43,7 @@ public:
     cmd_tokeniser_impl();
     ~cmd_tokeniser_impl();
     void begin_line();
-    void start(const str_iter& iter, const char* quote_pair) override;
+    void start(const str_iter& iter, const char* quote_pair, bool at_beginning=true) override;
 protected:
     char get_opening_quote() const;
     char get_closing_quote() const;
@@ -67,10 +68,11 @@ class cmd_word_tokeniser : public cmd_tokeniser_impl
 {
     typedef cmd_tokeniser_impl base;
 public:
-    void start(const str_iter& iter, const char* quote_pair) override;
+    void start(const str_iter& iter, const char* quote_pair, bool at_beginning=true) override;
     word_token next(unsigned int& offset, unsigned int& length) override;
 private:
     cmd_state m_cmd_state;
+    bool m_command_word;
 };
 
 //------------------------------------------------------------------------------

@@ -6,12 +6,17 @@
 #include "path.h"
 #include "str.h"
 #include "str_iter.h"
+#include "str_compare.h"
 #include <locale.h>
 #include <io.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <assert.h>
 #include <share.h>
+
+#ifndef _MSC_VER
+#define USE_PORTABLE
+#endif
 
 //------------------------------------------------------------------------------
 #ifdef _MSC_VER
@@ -111,7 +116,7 @@ static bool search_path(wstr_base& out, const wchar_t* file)
         if (len)
         {
             wpath.reserve(len);
-            len = GetEnvironmentVariableW(L"COMSPEC", wpath.data(), wpath.size());
+            len = GetEnvironmentVariableW(L"PATH", wpath.data(), wpath.size());
         }
     }
 
@@ -233,13 +238,28 @@ void set_shellname(const wchar_t* shell_name) { s_shell_name = shell_name; }
 const wchar_t* get_shellname() { return s_shell_name; }
 
 //------------------------------------------------------------------------------
-DWORD get_file_attributes(const wchar_t* path)
+static bool has_wildcard(const wchar_t* path)
+{
+    if (!path)
+        return false;
+    for (; *path; ++path)
+    {
+        if (*path == '*' || *path == '?')
+            return true;
+    }
+    return false;
+}
+
+//------------------------------------------------------------------------------
+DWORD get_file_attributes(const wchar_t* path, bool* symlink)
 {
     // FindFirstFileW can handle cases that GetFileAttributesW can't (e.g. files
     // open exclusively, some hidden/system files in the system root directory).
     // But it can't handle a root directory, so if the incoming path ends with a
     // separator then use GetFileAttributesW instead.
-    if (*path && path::is_separator(path[wcslen(path) - 1]))
+    if (!*path ||
+        path::is_separator(path[wcslen(path) - 1]) ||
+        has_wildcard(path))
     {
         DWORD attr = GetFileAttributesW(path);
         if (attr == INVALID_FILE_ATTRIBUTES)
@@ -247,6 +267,8 @@ DWORD get_file_attributes(const wchar_t* path)
             map_errno();
             return INVALID_FILE_ATTRIBUTES;
         }
+        if (symlink)
+            *symlink = false;
         return attr;
     }
 
@@ -258,15 +280,22 @@ DWORD get_file_attributes(const wchar_t* path)
         return INVALID_FILE_ATTRIBUTES;
     }
 
+    if (symlink)
+    {
+        *symlink = ((fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
+                    !(fd.dwFileAttributes & FILE_ATTRIBUTE_OFFLINE) &&
+                    (fd.dwReserved0 == IO_REPARSE_TAG_SYMLINK));
+    }
+
     FindClose(h);
     return fd.dwFileAttributes;
 }
 
 //------------------------------------------------------------------------------
-DWORD get_file_attributes(const char* path)
+DWORD get_file_attributes(const char* path, bool* symlink)
 {
     wstr<280> wpath(path);
-    return get_file_attributes(wpath.c_str());
+    return get_file_attributes(wpath.c_str(), symlink);
 }
 
 //------------------------------------------------------------------------------
@@ -352,10 +381,9 @@ bool make_dir(const char* dir)
     if (type == path_type_dir)
         return true;
 
-    str<> next;
-    path::get_directory(dir, next);
+    str<> next(dir);
 
-    if (!next.empty() && !path::is_root(next.c_str()))
+    if (path::to_parent(next, nullptr)  && !path::is_root(next.c_str()))
         if (!make_dir(next.c_str()))
             return false;
 
@@ -507,9 +535,23 @@ FILE* create_temp_file(str_base* out, const char* _prefix, const char* _ext, tem
         _get_errno(&err);
         if (err == EINVAL || err == EMFILE)
             break;
+        if (err == EACCES)
+        {
+            // Break out if there is no such file and yet access is denied.
+            // There's no point doing 65535 retries.
+            const DWORD attr = GetFileAttributesW(wpath.c_str());
+            if (attr == INVALID_FILE_ATTRIBUTES)
+                return nullptr;
+        }
 
         unique++;
         wpath.truncate(base_len);
+    }
+
+    if (!f)
+    {
+        map_errno(ERROR_NO_MORE_FILES);
+        return nullptr;
     }
 
     if (out)
@@ -517,9 +559,6 @@ FILE* create_temp_file(str_base* out, const char* _prefix, const char* _ext, tem
         wstr_iter tmpi(wpath.c_str(), wpath.length());
         to_utf8(*out, tmpi);
     }
-
-    if (!f)
-        map_errno(ERROR_NO_MORE_FILES);
 
     return f;
 }
@@ -616,6 +655,22 @@ bool get_env(const char* name, str_base& out)
         {
             out.clear();
             out.format("%d", os::get_errorlevel());
+            return true;
+        }
+        else if (stricmp(name, "CD") == 0)
+        {
+            os::get_current_dir(out);
+            return true;
+        }
+        else if (stricmp(name, "RANDOM") == 0)
+        {
+            out.clear();
+            out.format("%d", rand());
+            return true;
+        }
+        else if (stricmp(name, "CMDCMDLINE") == 0)
+        {
+            out = GetCommandLineW();
             return true;
         }
 
@@ -1072,6 +1127,231 @@ HANDLE dup_handle(HANDLE process_handle, HANDLE h, bool inherit)
     return new_h;
 }
 
+//------------------------------------------------------------------------------
+bool disambiguate_abbreviated_path(const char*& in, str_base& out)
+{
+    out.clear();
+
+    // Strip quotes.  This may seem surprising, but it's what CMD does and it
+    // works well.
+    str_moveable tmp;
+    concat_strip_quotes(tmp, in);
+
+    // Find the last path separator.
+    const char* last_sep = nullptr;
+    for (const char* walk = tmp.c_str() + tmp.length(); walk-- > tmp.c_str();)
+    {
+        if (path::is_separator(*walk))
+        {
+            last_sep = walk;
+            break;
+        }
+    }
+
+    // If there are no path separators then there's nothing to disambiguate.
+    if (!last_sep || last_sep == tmp.c_str())
+        return false;
+
+    // Don't operate on UNC paths, for performance reasons.
+    if (path::is_unc(tmp.c_str()) || path::is_incomplete_unc(tmp.c_str()))
+        return false;
+
+    str<280> next;
+    str<280> parse;
+    wstr_moveable wnext;
+    wstr_moveable wadd;
+
+    // Any \\?\ segment should be kept as-is.
+    const unsigned int ssqs = path::past_ssqs(tmp.c_str());
+    parse.concat(tmp.c_str(), ssqs);
+
+    // Don't operate on remote drives, for performance reasons.
+    str<16> tmp2;
+    if (path::get_drive(tmp.c_str() + ssqs, tmp2))
+    {
+        switch (os::get_drive_type(tmp2.c_str()))
+        {
+        case os::drive_type_invalid:
+        case os::drive_type_remote:
+            return false;
+        }
+    }
+    parse << tmp2;
+
+    // Identify the range to be parsed, up to but not including the last path
+    // separator character.
+    unsigned int parse_len = static_cast<unsigned int>(last_sep - tmp.c_str());
+    wstr_moveable disambiguated;
+    disambiguated = parse.c_str();
+
+    bool unique = false;
+    while (parse.length() < parse_len)
+    {
+        // Get next path component (e.g. "\dir").
+        next.clear();
+        while (parse.length() < parse_len)
+        {
+            const char ch = tmp.c_str()[parse.length()];
+            if (!path::is_separator(ch))
+                break;
+            next.concat(&ch, 1);
+            parse.concat(&ch, 1);
+        }
+        while (parse.length() < parse_len)
+        {
+            const char ch = tmp.c_str()[parse.length()];
+            if (path::is_separator(ch))
+                break;
+            next.concat(&ch, 1);
+            parse.concat(&ch, 1);
+        }
+
+        // Convert to UTF16.
+        assert(next.length());
+        wnext.clear();
+        to_utf16(wnext, next.c_str());
+
+        // Handle trailing path separators.
+        assert(wnext.length());
+        if (path::is_separator(wnext[wnext.length() - 1]))
+        {
+            const wchar_t ch = PATH_SEP_CHAR;
+            disambiguated.concat(&ch, 1);
+            assert(unique);
+            break;
+        }
+
+        // Append star to check for ambiguous matches.
+        const unsigned int committed = disambiguated.length();
+        disambiguated << wnext << L"*";
+
+        // Lookup in file system.
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileW(disambiguated.c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE)
+            return false;
+
+        while (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+        {
+            if (!FindNextFileW(h, &fd))
+            {
+                FindClose(h);
+                return false;
+            }
+        }
+
+        // Skip past the leading separator, if any, in the directory component.
+        const wchar_t *dir = wnext.c_str();
+        while (path::is_separator(*dir))
+            ++dir;
+        const unsigned int dir_len = static_cast<unsigned int>(wcslen(dir));
+
+        // Copy file name because FindNextFileW will overwrite it.
+        wadd = fd.cFileName;
+
+        // Check for an exact or unique match.
+        unique = wadd.iequals(dir);
+        if (!unique)
+        {
+            wstr_moveable best;
+            bool have_best = false;
+
+            if (wcsncmp(dir, fd.cFileName, dir_len) == 0)
+            {
+                best = fd.cFileName;
+                have_best = true;
+            }
+
+            do
+            {
+                unique = !FindNextFileW(h, &fd);
+            }
+            while (!unique && !(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY));
+
+            if (!unique)
+            {
+                // Find lcd.
+                int match_len = str_compare<wchar_t, true/*compute_lcd*/>(wadd.c_str(), fd.cFileName);
+                if (match_len >= 0)
+                    wadd.truncate(match_len);
+
+                // Find best match for the case of the original input.
+                do
+                {
+                    if (!have_best && wcsncmp(fd.cFileName, dir, dir_len) == 0)
+                    {
+                        best = fd.cFileName;
+                        have_best = true;
+                    }
+                }
+                while (FindNextFileW(h, &fd));
+            }
+
+            if (have_best)
+            {
+                int match_len = str_compare<wchar_t, true/*compute_lcd*/>(best.c_str(), wadd.c_str());
+                if (match_len >= 0)
+                    best.truncate(match_len);
+                wadd = std::move(best);
+            }
+        }
+        FindClose(h);
+
+        // If lcd is empty, use the name from the input string (e.g. a leading
+        // wildcard can cause this to happen).
+        if (!wadd.length())
+            wadd = dir;
+
+        // Append the directory component to the disambiguated output string.
+        disambiguated.truncate(committed);
+        if (path::is_separator(wnext.c_str()[0]))
+        {
+            const wchar_t ch = PATH_SEP_CHAR;
+            disambiguated.concat(&ch, 1);
+        }
+        disambiguated << wadd;
+
+        // If it's not an exact or unique match, then it's been disambiguated
+        // as much as possible.
+        if (!unique)
+        {
+            // disambiguated contains the disambiguated part.
+            // parsed contains the corresponding ambiguous part.
+
+            // FUTURE: Use the rest of the directory components to do further
+            // deductive disambiguation, instead of stopping?  Zsh even
+            // restricts the completions accordingly...  But that seems
+            // prohibitively complex in Clink due to how much control it
+            // grants to match generators.
+
+            break;
+        }
+    }
+
+    // Return the disambiguated string.
+    out.clear();
+    to_utf8(out, disambiguated.c_str());
+
+    // If the input is unambiguous and is already disambiguated then report that
+    // disambiguation wasn't possible.
+    if (unique && memcmp(out.c_str(), tmp.c_str(), out.length()) == 0)
+    {
+        out.clear();
+        return false;
+    }
+
+    // Return how much of the input was disambiguated.
+    in += parse.length();
+    if (out.length() && path::is_separator(out[out.length() - 1]))
+    {
+        while (path::is_separator(*in))
+            ++in;
+    }
+
+    // Return whether the input has been fully disambiguated.
+    return unique;
+}
+
 }; // namespace os
 
 
@@ -1079,11 +1359,11 @@ HANDLE dup_handle(HANDLE process_handle, HANDLE h, bool inherit)
 #if defined(DEBUG)
 
 //------------------------------------------------------------------------------
-int dbg_get_env_int(const char* name)
+int dbg_get_env_int(const char* name, int default_value)
 {
     char tmp[32];
     int len = GetEnvironmentVariableA(name, tmp, sizeof(tmp));
-    int val = (len > 0 && len < sizeof(tmp)) ? atoi(tmp) : 0;
+    int val = (len > 0 && len < sizeof(tmp)) ? atoi(tmp) : default_value;
     return val;
 }
 
@@ -1091,6 +1371,14 @@ int dbg_get_env_int(const char* name)
 static void dbg_vprintf_row(int row, const char* fmt, va_list args)
 {
     str<> tmp;
+    if (row < 0)
+    {
+        tmp.vformat(fmt, args);
+        wstr<> wtmp(tmp.c_str());
+        OutputDebugStringW(wtmp.c_str());
+        return;
+    }
+
     tmp << "\x1b[s\x1b[";
     if (row > 0)
     {

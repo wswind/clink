@@ -60,8 +60,12 @@ public:
     virtual void        set_prompt(const char* prompt, const char* rprompt, bool redisplay) override;
     virtual bool        get_line(str_base& out) override;
     virtual bool        edit(str_base& out, bool edit=true) override;
+    virtual void        override_line(const char* line, const char* needle, int point) override;
     virtual bool        update() override;
     virtual void        update_matches() override;
+#ifdef DEBUG
+    virtual bool        is_line_overridden() override;
+#endif
 
     // input_dispatcher
     virtual void        dispatch(int bind_group) override;
@@ -148,7 +152,6 @@ private:
     selectcomplete_impl m_selectcomplete;
     textlist_impl       m_textlist;
     key_t               m_prev_key;
-    unsigned char       m_keys_size;
     unsigned char       m_flags = 0;
     int                 m_generation_id = 0;
     str<64>             m_needle;
@@ -162,7 +165,12 @@ private:
     words               m_classify_words;
 
     str<16>             m_prev_command_word;
+    unsigned int        m_prev_command_word_offset;
     bool                m_prev_command_word_quoted;
+
+    const char*         m_override_needle = nullptr;
+    words               m_override_words;
+    commands            m_override_commands;
 
 #ifdef DEBUG
     bool                m_in_matches_ready = false;

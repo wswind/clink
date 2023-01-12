@@ -37,12 +37,14 @@ local function compare_values(t, a, b)
 end
 
 --------------------------------------------------------------------------------
-local function do_embed()
+local function do_embed(debug_info)
     -- Find the Lua compilers.
     local archs = {
         ["64"] = { luac = os.matchfiles(".build/*/bin/final/luac_x64.exe")[1] },
         ["86"] = { luac = os.matchfiles(".build/*/bin/final/luac_x86.exe")[1] },
     }
+
+    debug_info = debug_info and "" or " -s"
 
     for name, arch in spairs(archs) do
         if not arch.luac then
@@ -78,7 +80,7 @@ local function do_embed()
                 out:write("#if ARCHITECTURE == "..name.."\n")
 
                 -- Compile the input Lua script to binary.
-                exec(arch.luac.." -s -o .build/embed_temp "..file)
+                exec(arch.luac..debug_info.." -o .build/embed_temp "..file)
                 local bin_in = io.open(".build/embed_temp", "rb")
                 local bin_data = bin_in:read("*a")
                 bin_in:close()
@@ -122,10 +124,251 @@ local function do_embed()
 end
 
 --------------------------------------------------------------------------------
+local function escape_cpp(text)
+    return text:gsub("([\"\\])", "\\%1")
+end
+
+--------------------------------------------------------------------------------
+local function write_case(out, line, count, note)
+    local s = "\"" .. escape_cpp(line) .. "\",  "
+    local pad = 56 - #s
+    if pad > 0 then
+        s = s .. string.rep(" ", pad)
+    end
+    note = note and ("  **" .. note .. "**") or ""
+    out:write(s .. "// case #" .. count .. note .. "\n")
+end
+
+--------------------------------------------------------------------------------
+local function do_wildmatch()
+    local expected = 219
+    local count = 0
+
+    local out = "wildmatch/tests/t3070-wildmatch.i"
+    local special1 = [==[match 1 1 '\' '[\\]']==]
+    local special2 = [==[match 1 1 '\' '[\\,]']==]
+    local special3 = [==[match 1 1 '\' '[[-\]]']==]
+
+    print("\n"..out)
+
+    local file = io.open("wildmatch/tests/t3070-wildmatch.sh", "r")
+    out = io.open(out, "w")
+
+    local header = {
+        "// Generated from t3070-wildmatch.sh by 'premake5 embed'.",
+        "",
+        "// Test case format:",
+        "//",
+        "//  <x>match <wmode> <fnmode> <string> <pattern>",
+        "//  <x>imatch <wmode> <string> <pattern>",
+        "//  <x>pathmatch <wmode> <string> <pattern>",
+        "//",
+        "// match        Tests with wildmatch() and fnmatch(), and with slashes and backslashes.",
+        "// imatch       Tests with wildmatch() ignoring case, with slashes and backslashes.",
+        "// pathmatch    Tests with wildmatch() without WM_PATHNAME, with slashes and backslashes.",
+        "//",
+        "// <x>          / to run the test only with the verbatim <string>,",
+        "//              \\ to run the test only with slashes in <string> converted to backslashes,",
+        "//              or leave off <x> to run the test once each way.",
+        "//",
+        "// <wmode>      1 if the test is expected to match with wildmatch(),",
+        "//              0 if the test is expected to fail,",
+        "//              or any other value to skip running the test with wildmatch().",
+        "//",
+        "// <fnmode>     1 if the test is expected to match with fnmatch(),",
+        "//              0 if the test is expected to fail,",
+        "//              or any other value to skip running the test with fnmatch().",
+        "",
+        "static const char* const c_cases[] = {",
+        "",
+    }
+
+    for _,line in ipairs(header) do
+        out:write(line)
+        out:write("\n")
+    end
+
+    local keep_blank
+    for line in file:lines() do
+        if line:find("^#") then
+            local comment = line:match("^#([^!].+)$")
+            if comment then
+                keep_blank = true
+                out:write("//" .. comment .. "\n")
+            end
+        elseif keep_blank and line == "" then
+            out:write("\n")
+        else
+            local op = line:match("^(%w+) ")
+            if op then
+                local note
+                if line == special1 or line == special2 or line == special3 then
+                    note = "MODIFIED"
+                    line = "/" .. line
+                elseif line == "match 1 0 'deep/foo/bar/baz/x' 'deep/**/***/****/*****'" then
+                    note = "MODIFIED"
+                    line = "match 1 0 'deep/foo/bar/baz/x' 'deep/**/***/****'"
+                end
+                count = count + 1
+                write_case(out, line, count, note)
+            end
+
+            if line == "match 0 0 'foo/bar' 'foo[/]bar'" then
+                count = count + 1
+                write_case(out, "match 0 0 'foo/bar' 'foo[^a-z]bar'", count, "ADDITIONAL")
+            elseif line == "pathmatch 1 foo/bar 'foo[/]bar'" then
+                count = count + 1
+                write_case(out, "pathmatch 1 foo/bar 'foo[^a-z]bar'", count, "ADDITIONAL")
+            elseif line == "match 1 0 'deep/foo/bar/baz/x' 'deep/**/***/****'" then
+                count = count + 1
+                write_case(out, "match 1 1 'deep/foo/bar/baz/x' 'deep/**/***/****/*****'", count, "ADDITIONAL")
+            end
+        end
+    end
+
+    -- Don't need to force an extra blank line at the end, because
+    -- t3070-wildmatch.sh itself includes an extra blank line at the end.
+    out:write("};\n")
+    out:write("\n")
+    out:write("static const int c_expected_count = " .. expected .. ";\n")
+
+    file:close()
+    out:close()
+
+    print("   " .. count .. " test cases")
+
+    if count ~= expected then
+        error("\x1b[0;31;1mFAILED: expected " .. expected .. " tests; found " .. count .. " instead.")
+    end
+end
+
+--------------------------------------------------------------------------------
+local function load_indexed_emoji_table(file)
+    -- Collect the emoji characters.
+    --
+    -- This uses a simplistic approach of taking the first codepoint from each
+    -- line in the input file.
+    local indexed = {}
+    for line in file:lines() do
+        local x = line:match("^([0-9A-Fa-f]+) ")
+        if x then
+            local d = tonumber(x, 16)
+            if d then
+                indexed[d] = true
+            end
+        end
+    end
+    return indexed
+end
+
+--------------------------------------------------------------------------------
+local function output_character_ranges(out, tag, indexed, filtered)
+
+    out:write("\nstatic const struct interval " .. tag .. "[] = {\n\n")
+
+    -- Build sorted array of characters.
+    local chars = {}
+    for d, _ in pairs(indexed) do
+        if not (filtered and filtered[d]) then
+            table.insert(chars, d)
+        end
+    end
+    table.sort(chars)
+
+    -- Optimize the set of characters into ranges.
+    local count_ranges = 0
+    local first
+    local last
+    for _, d in ipairs(chars) do
+        if last and last + 1 ~= d then
+            count_ranges = count_ranges + 1
+            out:write(string.format("{ 0x%X, 0x%X },\n", first, last))
+            first = nil
+        end
+        if not first then
+            first = d
+        end
+        last = d
+    end
+    if first then
+        count_ranges = count_ranges + 1
+        out:write(string.format("{ 0x%X, 0x%X },\n", first, last))
+    end
+
+    out:write("\n};\n")
+
+    return chars, count_ranges
+end
+
+--------------------------------------------------------------------------------
+local function do_emojis()
+    local out = "clink/terminal/src/emoji-test.i"
+
+    print("\n"..out)
+
+    local file = io.open("clink/terminal/src/emoji-test.txt", "r")
+    local filter = io.open("clink/terminal/src/emoji-filter.txt", "r")
+    out = io.open(out, "w")
+
+    local header = {
+        "// Generated from emoji-test.txt by 'premake5 embed'.",
+    }
+
+    for _,line in ipairs(header) do
+        out:write(line)
+        out:write("\n")
+    end
+
+    -- Collect the emoji characters.
+    local indexed = load_indexed_emoji_table(file)
+    local filtered = load_indexed_emoji_table(filter)
+    file:close()
+    filter:close()
+
+    -- Output ranges of double-width emoji characters.
+    local emojis, count_ranges = output_character_ranges(out, "emojis", indexed, filtered)
+
+    -- Output ranges of ambiguous emoji characters.
+    local ignored = {
+        [0x0023] = true,
+        [0x002A] = true,
+        [0x0030] = true,
+        [0x0031] = true,
+        [0x0032] = true,
+        [0x0033] = true,
+        [0x0034] = true,
+        [0x0035] = true,
+        [0x0036] = true,
+        [0x0037] = true,
+        [0x0038] = true,
+        [0x0039] = true,
+    }
+    local ambiguous = output_character_ranges(out, "ambiguous_emojis", filtered, ignored)
+
+    out:close()
+
+    print("   " .. #emojis .. " emojis; " .. count_ranges .. " ranges")
+    print("   " .. #ambiguous .. " ambiguous emojis")
+end
+
+--------------------------------------------------------------------------------
 newaction {
     trigger = "embed",
     description = "Clink: Update embedded scripts for Clink",
     execute = function ()
         do_embed()
+        do_wildmatch()
+        do_emojis()
+    end
+}
+
+--------------------------------------------------------------------------------
+newaction {
+    trigger = "embed_debug",
+    description = "Clink: Update embedded scripts for Clink with debugging info",
+    execute = function ()
+        do_embed(true--[[debug_info]])
+        do_wildmatch()
+        do_emojis()
     end
 }

@@ -4,8 +4,10 @@
 #include "pch.h"
 #include "lua_input_idle.h"
 #include "lua_state.h"
+#include "async_lua_task.h"
 
 #include <core/base.h>
+#include <lib/reclassify.h>
 
 #include <assert.h>
 
@@ -16,6 +18,8 @@ extern "C" {
 }
 
 //------------------------------------------------------------------------------
+extern void host_filter_prompt();
+extern void host_invalidate_matches();
 extern void set_yield_wake_event(HANDLE event);
 static lua_input_idle* s_idle = nullptr;
 
@@ -27,34 +31,43 @@ void kick_idle()
 }
 
 //------------------------------------------------------------------------------
+bool lua_input_idle::s_signaled_delayed_init = false;
+bool lua_input_idle::s_signaled_reclassify = false;
+static bool s_refilter_after_terminal_resize = false;
+static DWORD s_terminal_resized = 0;    // Tick count of most recent resize.
+static HANDLE s_wake_event = 0;
+
+// After the terminal is resized, wait for this many milliseconds before
+// automatically rerunning the prompt filters.
+const DWORD c_terminal_resize_refilter_delay = 500;
+
+//------------------------------------------------------------------------------
 lua_input_idle::lua_input_idle(lua_state& state)
 : m_state(state)
 {
     assert(!s_idle);
     s_idle = this;
+    if (!s_wake_event)
+    {
+        s_wake_event = CreateEvent(nullptr, false, false, nullptr);
+        set_yield_wake_event(s_wake_event);
+    }
 }
 
 //------------------------------------------------------------------------------
 lua_input_idle::~lua_input_idle()
 {
     s_idle = nullptr;
-    set_yield_wake_event(nullptr);
 }
 
 //------------------------------------------------------------------------------
 void lua_input_idle::reset()
 {
-    HANDLE old_event = m_event;
+    s_signaled_delayed_init = false;
+    s_signaled_reclassify = false;
 
-    // Create new event before closing old handle, to prevent the OS from
-    // reusing the same event handle after it's closed.
     m_enabled = true;
     m_iterations = 0;
-    m_event = CreateEvent(nullptr, false, false, nullptr);
-    set_yield_wake_event(m_event);
-
-    if (old_event)
-        CloseHandle(old_event);
 }
 
 //------------------------------------------------------------------------------
@@ -72,6 +85,14 @@ bool lua_input_idle::is_enabled()
 //------------------------------------------------------------------------------
 unsigned lua_input_idle::get_timeout()
 {
+    // When terminal resize handling is active, it controls the timeout.
+    // Coroutines are not resumed while the terminal is being resized.
+    if (s_terminal_resized)
+    {
+        const DWORD timeout = c_terminal_resize_refilter_delay - (GetTickCount() - s_terminal_resized);
+        return (timeout < c_terminal_resize_refilter_delay) ? timeout : 0;
+    }
+
     m_iterations++;
 
     if (!is_enabled())
@@ -99,15 +120,58 @@ unsigned lua_input_idle::get_timeout()
 //------------------------------------------------------------------------------
 void* lua_input_idle::get_waitevent()
 {
-    return m_event;
+    return s_wake_event;
 }
 
 //------------------------------------------------------------------------------
 void lua_input_idle::on_idle()
 {
-    assert(m_enabled);
+    // Don't resume coroutines while the terminal resize timeout is in effect,
+    // as that would bypass the resume frequency logic.
+    if (s_terminal_resized)
+    {
+        // If it's been more than 0.5 seconds since the terminal was last
+        // resized, then refilter the prompt.  Note that if automatic refilter
+        // isn't enabled, then s_terminal_resized won't be set in the first
+        // place, and this won't be reached.
+        if (GetTickCount() - s_terminal_resized >= c_terminal_resize_refilter_delay)
+        {
+            s_terminal_resized = 0;
+            host_filter_prompt();
+        }
+    }
+    else
+    {
+        // An example how this can be reached with !m_enabled is when
+        // io.popenyield() wakes idle after getting the process exit code, but
+        // it can't know whether any Lua code has/will yield to wait for the
+        // exit code.  If Lua code hasn't finished or is yielding to wait,
+        // then m_enabled will still be true.  But if the corresponding Lua
+        // coroutine finished without ever yielding to wait for the exit code
+        // then m_enabled may be false, if that was the last coroutine.  In
+        // that case, there are no coroutines and so short circuiting is an
+        // appropriate optimization here.
+        if (m_enabled)
+            resume_coroutines();
+    }
 
-    resume_coroutines();
+    if (s_signaled_delayed_init)
+    {
+        s_signaled_delayed_init = false;
+        host_invalidate_matches();
+    }
+
+    if (s_signaled_reclassify)
+    {
+        s_signaled_reclassify = false;
+        host_reclassify(reclassify_reason::force);
+    }
+}
+
+//------------------------------------------------------------------------------
+void lua_input_idle::on_task_manager()
+{
+    task_manager_on_idle(m_state);
 }
 
 //------------------------------------------------------------------------------
@@ -117,6 +181,35 @@ void lua_input_idle::kick()
     {
         m_enabled = true;
     }
+}
+
+//------------------------------------------------------------------------------
+void lua_input_idle::signal_delayed_init()
+{
+    s_signaled_delayed_init = true;
+}
+
+//------------------------------------------------------------------------------
+void lua_input_idle::signal_reclassify()
+{
+    s_signaled_reclassify = true;
+}
+
+//------------------------------------------------------------------------------
+void set_refilter_after_resize(bool refilter)
+{
+    s_refilter_after_terminal_resize = refilter;
+    if (!refilter)
+        s_terminal_resized = 0;
+}
+
+//------------------------------------------------------------------------------
+void signal_terminal_resized()
+{
+    if (s_refilter_after_terminal_resize)
+        s_terminal_resized = GetTickCount();
+    else if (s_terminal_resized)
+        s_terminal_resized = 0;
 }
 
 //------------------------------------------------------------------------------

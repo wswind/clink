@@ -3,667 +3,68 @@
 
 #include "pch.h"
 #include "lua_state.h"
+#include "lua_input_idle.h"
 #include "line_state_lua.h"
+#include "line_states_lua.h"
 #include "prompt.h"
+#include "recognizer.h"
+#include "async_lua_task.h"
 #include "../../app/src/version.h" // Ugh.
 
 #include <core/base.h>
-#include <core/log.h>
 #include <core/os.h>
-#include <core/path.h>
-#include <core/str.h>
 #include <core/str_compare.h>
-#include <core/str_iter.h>
 #include <core/str_transform.h>
-#include <core/str_tokeniser.h>
 #include <core/str_unordered_set.h>
 #include <core/settings.h>
 #include <core/linear_allocator.h>
 #include <core/debugheap.h>
-#include <lib/intercept.h>
 #include <lib/popup.h>
-#include <lib/word_collector.h>
 #include <lib/cmd_tokenisers.h>
 #include <lib/reclassify.h>
+#include <lib/matches_lookaside.h>
 #include <terminal/terminal_helpers.h>
 #include <terminal/printer.h>
 #include <terminal/screen_buffer.h>
-#include <readline/readline.h>
 
 extern "C" {
 #include <lua.h>
+#include <lstate.h>
 #include <readline/history.h>
 }
 
-#include <list>
-#include <memory>
+#include <share.h>
 #include <mutex>
-#include <thread>
-#include <unordered_set>
-#include <vector>
-#include <shlwapi.h>
 
 
 
 //------------------------------------------------------------------------------
 extern int force_reload_scripts();
-extern void host_invalidate_matches();
+extern void host_signal_delayed_init();
 extern void host_mark_deprecated_argmatcher(const char* name);
 extern void set_suggestion(const char* line, unsigned int endword_offset, const char* suggestion, unsigned int offset);
-extern setting_bool g_gui_popups;
+extern void set_refilter_after_resize(bool refilter);
+extern const char* get_popup_colors();
+extern const char* get_popup_desc_colors();
 extern setting_enum g_dupe_mode;
-extern setting_color g_color_unrecognized;
-extern setting_color g_color_executable;
 
-
-
-//------------------------------------------------------------------------------
-static bool search_for_extension(str_base& full, const char* word, str_base& out)
-{
-    path::append(full, "");
-    const unsigned int trunc = full.length();
-
-    str<> pathext;
-    if (!os::get_env("pathext", pathext))
-        return false;
-
-    str_tokeniser tokens(pathext.c_str(), ";");
-    const char *start;
-    int length;
-
-    const char* ext = path::get_extension(word);
-    str<16> token_ext;
-
-    while (str_token token = tokens.next(start, length))
-    {
-        if (ext)
-        {
-            token_ext.clear();
-            token_ext.concat(start, length);
-            if (token_ext.iequals(ext))
-            {
-                full.truncate(trunc);
-                path::append(full, word);
-                if (os::get_path_type(full.c_str()) == os::path_type_file)
-                {
-                    out = full.c_str();
-                    return true;
-                }
-            }
-        }
-        else
-        {
-            full.truncate(trunc);
-            path::append(full, word);
-            full.concat(start, length);
-            if (os::get_path_type(full.c_str()) == os::path_type_file)
-            {
-                out = full.c_str();
-                return true;
-            }
-        }
-    }
-
-    return false;
-}
-
-//------------------------------------------------------------------------------
-static bool search_for_executable(const char* _word, const char* cwd, str_base& out)
-{
-    // Bail out early if it's obviously not going to succeed.
-    if (strlen(_word) >= MAX_PATH)
-        return false;
-
-// TODO: dynamically load NeedCurrentDirectoryForExePathW.
-    wstr<32> word(_word);
-    const bool need_cwd = !!NeedCurrentDirectoryForExePathW(word.c_str());
-    const bool need_path = !rl_last_path_separator(_word);
-
-    // Make list of paths to search.
-    str<> tmp;
-    str<> paths;
-    if (need_cwd)
-        paths = cwd;
-    if (need_path && os::get_env("PATH", tmp))
-    {
-        if (paths.length() > 0)
-            paths.concat(";", 1);
-        paths.concat(tmp.c_str(), tmp.length());
-    }
-
-    str<> full;
-    str<280> token;
-    str_tokeniser tokens(paths.c_str(), ";");
-    while (tokens.next(token))
-    {
-        token.trim();
-        if (token.empty())
-            continue;
-
-        // Get full path name.
-        path::join(cwd, token.c_str(), tmp);
-        if (!os::get_full_path_name(tmp.c_str(), full, tmp.length()))
-            continue;
-
-        // Skip drives that are unknown, invalid, or remote.
-        {
-            char drive[4];
-            drive[0] = full.c_str()[0];
-            drive[1] = ':';
-            drive[2] = '\\';
-            drive[3] = '\0';
-            if (os::get_drive_type(drive) < os::drive_type_removable)
-                continue;
-        }
-
-        // Try PATHEXT extensions.
-        if (search_for_extension(full, _word, out))
-            return true;
-    }
-
-    return false;
-}
-
-//------------------------------------------------------------------------------
-bool has_file_association(const char* name)
-{
-    const char* ext = path::get_extension(name);
-    if (!ext)
-        return false;
-
-    if (os::get_path_type(name) != os::path_type_file)
-        return false;
-
-    wstr<32> wext(ext);
-    DWORD cchOut = 0;
-    HRESULT hr = AssocQueryStringW(ASSOCF_INIT_IGNOREUNKNOWN|ASSOCF_NOFIXUPS, ASSOCSTR_EXECUTABLE, wext.c_str(), nullptr, nullptr, &cchOut);
-    if (FAILED(hr) || !cchOut)
-        return false;
-
-    return true;
-}
-
-//------------------------------------------------------------------------------
-class recognizer
-{
-    friend HANDLE get_recognizer_event();
-
-    struct cache_entry
-    {
-        str_moveable        m_file;
-        recognition         m_recognition;
-    };
-
-    struct entry
-    {
-                            entry() {}
-        bool                empty() const { return m_key.empty(); }
-        void                clear();
-        str_moveable        m_key;
-        str_moveable        m_word;
-        str_moveable        m_cwd;
-    };
-
-public:
-                            recognizer();
-                            ~recognizer() { shutdown(); }
-    void                    clear();
-    int                     find(const char* key, recognition& cached, str_base* file) const;
-    bool                    enqueue(const char* key, const char* word, const char* cwd, recognition* cached=nullptr);
-    bool                    need_refresh();
-    void                    end_line();
-
-private:
-    bool                    usable() const;
-    bool                    store(const char* word, const char* file, recognition cached, bool pending=false);
-    bool                    dequeue(entry& entry);
-    bool                    set_result_available(bool available);
-    void                    notify_ready(bool available);
-    void                    shutdown();
-    static void             proc(recognizer* r);
-
-private:
-    linear_allocator        m_heap;
-    str_unordered_map<cache_entry> m_cache;
-    str_unordered_map<cache_entry> m_pending;
-    entry                   m_queue;
-    mutable std::recursive_mutex m_mutex;
-    std::unique_ptr<std::thread> m_thread;
-    HANDLE                  m_event = nullptr;
-    bool                    m_processing = false;
-    bool                    m_result_available = false;
-    bool                    m_zombie = false;
-
-    static HANDLE           s_ready_event;
-};
-
-//------------------------------------------------------------------------------
-HANDLE recognizer::s_ready_event = nullptr;
-static recognizer s_recognizer;
-
-//------------------------------------------------------------------------------
-HANDLE get_recognizer_event()
-{
-    str<32> tmp;
-    g_color_unrecognized.get_descriptive(tmp);
-    if (tmp.empty())
-    {
-        str<32> tmp2;
-        g_color_executable.get_descriptive(tmp2);
-        if (tmp2.empty())
-            return nullptr;
-    }
-
-    // Locking is not needed because concurrency is not possible until after
-    // this event has been created, which can only happen on the main thread.
-
-    if (s_recognizer.m_zombie)
-        return nullptr;
-    return s_recognizer.s_ready_event;
-}
-
-//------------------------------------------------------------------------------
-bool check_recognizer_refresh()
-{
-    return s_recognizer.need_refresh();
-}
-
-//------------------------------------------------------------------------------
-extern "C" void end_recognizer()
-{
-    s_recognizer.end_line();
-    s_recognizer.clear();
-}
-
-//------------------------------------------------------------------------------
-void recognizer::entry::clear()
-{
-    m_key.clear();
-    m_word.clear();
-    m_cwd.clear();
-}
-
-//------------------------------------------------------------------------------
-recognizer::recognizer()
-: m_heap(1024)
-{
-#ifdef DEBUG
-    // Singleton; assert if there's ever more than one.
-    static bool s_created = false;
-    assert(!s_created);
-    s_created = true;
+#ifdef _WIN64
+static const char c_uninstall_key[] = "SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
+#else
+static const char c_uninstall_key[] = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
 #endif
 
-    s_recognizer.s_ready_event = CreateEvent(nullptr, true, false, nullptr);
-}
-
-//------------------------------------------------------------------------------
-void recognizer::clear()
-{
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
-
-    m_queue.clear();
-    m_cache.clear();
-    m_pending.clear();
-    m_heap.reset();
-}
-
-//------------------------------------------------------------------------------
-int recognizer::find(const char* key, recognition& cached, str_base* file) const
-{
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
-
-    if (usable())
-    {
-        auto const iter = m_cache.find(key);
-        if (iter != m_cache.end())
-        {
-            cached = iter->second.m_recognition;
-            if (file)
-                *file = iter->second.m_file.c_str();
-            return 1;
-        }
-    }
-
-    if (usable())
-    {
-        auto const iter = m_pending.find(key);
-        if (iter != m_pending.end())
-        {
-            cached = iter->second.m_recognition;
-            if (file)
-                *file = iter->second.m_file.c_str(); // Always empty.
-            return -1;
-        }
-    }
-
-    return 0;
-}
-
-//------------------------------------------------------------------------------
-bool recognizer::enqueue(const char* key, const char* word, const char* cwd, recognition* cached)
-{
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
-
-    if (!usable())
-        return false;
-
-    assert(s_ready_event);
-
-    if (!m_event)
-    {
-        m_event = CreateEvent(nullptr, false, false, nullptr);
-        if (!m_event)
-            return false;
-    }
-
-    if (!m_thread)
-    {
-        dbg_ignore_scope(snapshot, "Recognizer thread");
-        m_thread = std::make_unique<std::thread>(&proc, this);
-    }
-
-    m_queue.m_key = key;
-    m_queue.m_word = word;
-    m_queue.m_cwd = cwd;
-
-    // Assume unrecognized at first.
-    store(key, nullptr, recognition::unrecognized, true/*pending*/);
-    if (cached)
-        *cached = recognition::unrecognized;
-
-    SetEvent(m_event);  // Signal thread there is work to do.
-    Sleep(0);           // Give up timeslice in case thread gets result quickly.
-    return true;
-}
-
-//------------------------------------------------------------------------------
-bool recognizer::need_refresh()
-{
-    return set_result_available(false);
-}
-
-//------------------------------------------------------------------------------
-void recognizer::end_line()
-{
-    HANDLE ready_event;
-    bool processing;
-
-    {
-        std::lock_guard<std::recursive_mutex> lock(m_mutex);
-        ready_event = s_ready_event;
-        processing = m_processing && !m_zombie;
-        // s_ready_event is never closed, so there is no concurrency concern
-        // about it going from non-null to null.
-        if (!ready_event)
-            return;
-    }
-
-    // If the recognizer is still processing something then wait briefly until
-    // processing is finished, in case it finishes quickly enough to be able to
-    // refresh the input line colors.
-    if (processing)
-    {
-        const DWORD tick_begin = GetTickCount();
-        while (true)
-        {
-            const volatile DWORD tick_now = GetTickCount();
-            const int timeout = int(tick_begin) + 2500 - int(tick_now);
-            if (timeout < 0)
-                break;
-
-            if (WaitForSingleObject(ready_event, DWORD(timeout)) != WAIT_OBJECT_0)
-                break;
-
-            host_reclassify(reclassify_reason::recognizer);
-
-            std::lock_guard<std::recursive_mutex> lock(m_mutex);
-            if (!m_processing || !usable())
-                break;
-        }
-    }
-
-    host_reclassify(reclassify_reason::recognizer);
-}
-
-//------------------------------------------------------------------------------
-bool recognizer::usable() const
-{
-    return !m_zombie && s_ready_event;
-}
-
-//------------------------------------------------------------------------------
-bool recognizer::store(const char* word, const char* file, recognition cached, bool pending)
-{
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
-
-    if (!usable())
-        return false;
-
-    auto& map = pending ? m_pending : m_cache;
-
-    auto const iter = map.find(word);
-    if (iter != map.end())
-    {
-        cache_entry entry;
-        entry.m_file = file;
-        entry.m_recognition = cached;
-        map.insert_or_assign(iter->first, std::move(entry));
-        set_result_available(true);
-        return true;
-    }
-
-    dbg_ignore_scope(snapshot, "Recognizer");
-    const char* key = m_heap.store(word);
-    if (!key)
-        return false;
-
-    cache_entry entry;
-    entry.m_file = file;
-    entry.m_recognition = cached;
-    map.emplace(key, std::move(entry));
-    set_result_available(true);
-    return true;
-}
-
-//------------------------------------------------------------------------------
-bool recognizer::dequeue(entry& entry)
-{
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
-
-    if (!usable() || m_queue.empty())
-        return false;
-
-    entry = std::move(m_queue);
-    assert(m_queue.empty());
-    return true;
-}
-
-//------------------------------------------------------------------------------
-bool recognizer::set_result_available(const bool available)
-{
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
-
-    const bool was_available = m_result_available;
-    const bool changing = (available != m_result_available);
-
-    if (changing)
-        m_result_available = available;
-
-    if (s_ready_event)
-    {
-        if (!available)
-            ResetEvent(s_ready_event);
-        else if (changing)
-            SetEvent(s_ready_event);
-    }
-
-    return was_available;
-}
-
-//------------------------------------------------------------------------------
-void recognizer::notify_ready(bool available)
-{
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
-
-    if (available)
-        set_result_available(available);
-
-    // Always set the ready event, even if no results are available:  this lets
-    // end_line() stop waiting when the queue is finished being processed, even
-    // if no results are available.
-    if (s_ready_event)
-        SetEvent(s_ready_event);
-}
-
-//------------------------------------------------------------------------------
-void recognizer::shutdown()
-{
-    std::unique_ptr<std::thread> thread;
-
-    {
-        std::lock_guard<std::recursive_mutex> lock(m_mutex);
-
-        clear();
-        m_zombie = true;
-
-        if (m_event)
-            SetEvent(m_event);
-
-        thread = std::move(m_thread);
-    }
-
-    if (thread)
-        thread->join();
-
-    if (m_event)
-        CloseHandle(m_event);
-}
-
-//------------------------------------------------------------------------------
-void recognizer::proc(recognizer* r)
-{
-    while (true)
-    {
-        if (WaitForSingleObject(r->m_event, INFINITE) != WAIT_OBJECT_0)
-        {
-            // Uh oh.
-            Sleep(5000);
-        }
-
-        entry entry;
-        while (true)
-        {
-            {
-                std::lock_guard<std::recursive_mutex> lock(r->m_mutex);
-                if (r->m_zombie || !r->dequeue(entry))
-                {
-                    r->m_processing = false;
-                    r->m_pending.clear();
-                    if (!r->m_zombie)
-                        r->notify_ready(false);
-                    break;
-                }
-                r->m_processing = true;
-            }
-
-            // Search for executable file.
-            str<> found;
-            recognition result = recognition::unrecognized;
-            if (search_for_executable(entry.m_word.c_str(), entry.m_cwd.c_str(), found) ||
-                has_file_association(entry.m_word.c_str()))
-            {
-                result = recognition::executable;
-            }
-
-            // Store result.
-            r->store(entry.m_key.c_str(), found.c_str(), result);
-            r->notify_ready(true);
-        }
-    }
-}
-
-//------------------------------------------------------------------------------
-recognition recognize_command(const char* line, const char* word, bool quoted, bool& ready, str_base* file)
-{
-    ready = true;
-
-    str<> tmp;
-    if (!quoted)
-    {
-        str_iter iter(word);
-        while (iter.more())
-        {
-            const char* ptr = iter.get_pointer();
-            const int c = iter.next();
-            if (c != '^' || !iter.peek())
-                tmp.concat(ptr, static_cast<int>(iter.get_pointer() - ptr));
-        }
-        word = tmp.c_str();
-    }
-
-    str<> tmp2;
-    if (os::expand_env(word, -1, tmp2))
-        word = tmp2.c_str();
-
-    // Ignore UNC paths, because they can take up to 2 minutes to time out.
-    // Even running that on a thread would either starve the consumers or
-    // accumulate threads faster than they can finish.
-    if (path::is_separator(word[0]) && path::is_separator(word[1]))
-        return recognition::unknown;
-
-    // Check for directory intercepts (-, ..., ...., dir\, and so on).
-    if (intercept_directory(line) != intercept_result::none)
-        return recognition::navigate;
-
-    // Check for drive letter.
-    if (word[0] && word[1] == ':' && !word[2])
-    {
-        int type = os::get_drive_type(word);
-        if (type > os::drive_type_invalid)
-            return recognition::navigate;
-    }
-
-    // Check for cached result.
-    recognition cached;
-    const int found = s_recognizer.find(word, cached, file);
-    if (found)
-    {
-        ready = (found > 0);
-        return cached;
-    }
-
-    // Expand environment variables.
-    str<32> expanded;
-    const char* orig_word = word;
-    unsigned int len = static_cast<unsigned int>(strlen(word));
-    if (os::expand_env(word, len, expanded))
-    {
-        word = expanded.c_str();
-        len = expanded.length();
-    }
-
-    // Wildcards mean it can't be an executable file.
-    if (strchr(word, '*') || strchr(word, '?'))
-        return recognition::unrecognized;
-
-    // Queue for background thread processing.
-    str<> cwd;
-    os::get_current_dir(cwd);
-    if (!s_recognizer.enqueue(orig_word, word, cwd.c_str(), &cached))
-        return recognition::unknown;
-
-    ready = false;
-    return cached;
-}
-
-
+#ifdef TRACK_LOADED_LUA_FILES
+extern "C" int is_lua_file_loaded(lua_State* state, const char* filename);
+#endif
 
 //------------------------------------------------------------------------------
 /// -name:  clink.print
 /// -ver:   1.2.11
 /// -arg:   ...
-/// This works like <code>print()</code>, but this supports ANSI escape codes.
+/// This works like
+/// <a href="https://www.lua.org/manual/5.2/manual.html#pdf-print">print()</a>,
+/// but this supports ANSI escape codes and Unicode.
 ///
 /// If the special value <code>NONL</code> is included anywhere in the argument
 /// list then the usual trailing newline is omitted.  This can sometimes be
@@ -697,6 +98,7 @@ static int clink_print(lua_State* state)
     lua_getglobal(state, "NONL");           // Special value `NONL`.
     lua_getglobal(state, "tostring");       // Function to convert to string (reused each loop iteration).
 
+    int printed = 0;
     for (int i = 1; i <= n; i++)
     {
         // Check for magic `NONL` value.
@@ -730,7 +132,7 @@ static int clink_print(lua_State* state)
         lua_pop(state, 1);                  // Pop result.
 
         // Add tab character to the output.
-        if (i > 1)
+        if (printed++)
             out << "\t";
 
         // Add string result to the output.
@@ -809,32 +211,73 @@ extern "C" {
 extern int              get_clink_setting(lua_State* state);
 extern int              glob_impl(lua_State* state, bool dirs_only, bool back_compat);
 extern int              lua_execute(lua_State* state);
+extern int              get_screen_info_impl(lua_State* state, bool back_compat);
 
 //------------------------------------------------------------------------------
+/// -name:  clink.get_console_aliases
+/// -deprecated: os.getaliases
+
+//------------------------------------------------------------------------------
+/// -name:  clink.get_cwd
+/// -deprecated: os.getcwd
+
+//------------------------------------------------------------------------------
+/// -name:  clink.get_env
+/// -deprecated: os.getenv
+
+//------------------------------------------------------------------------------
+/// -name:  clink.get_env_var_names
+/// -deprecated: os.getenvnames
+
+//------------------------------------------------------------------------------
+/// -name:  clink.find_dirs
+/// -deprecated: os.globdirs
+/// -arg:   mask:string
+/// -arg:   [case_map:boolean]
+/// The <span class="arg">case_map</span> argument is ignored, because match
+/// generators are no longer responsible for filtering matches.  The match
+/// pipeline itself handles that internally now.
 int old_glob_dirs(lua_State* state)
 {
     return glob_impl(state, true, true/*back_compat*/);
 }
 
 //------------------------------------------------------------------------------
+/// -name:  clink.find_files
+/// -deprecated: os.globfiles
+/// -arg:   mask:string
+/// -arg:   [case_map:boolean]
+/// The <span class="arg">case_map</span> argument is ignored, because match
+/// generators are no longer responsible for filtering matches.  The match
+/// pipeline itself handles that internally now.
 int old_glob_files(lua_State* state)
 {
     return glob_impl(state, false, true/*back_compat*/);
 }
 
 //------------------------------------------------------------------------------
+/// -name:  clink.get_setting_str
+/// -deprecated: settings.get
 static int get_setting_str(lua_State* state)
 {
     return get_clink_setting(state);
 }
 
 //------------------------------------------------------------------------------
+/// -name:  clink.get_setting_int
+/// -deprecated: settings.get
 static int get_setting_int(lua_State* state)
 {
     return get_clink_setting(state);
 }
 
 //------------------------------------------------------------------------------
+/// -name:  clink.is_dir
+/// -deprecated: os.isdir
+
+//------------------------------------------------------------------------------
+/// -name:  clink.get_rl_variable
+/// -deprecated: rl.getvariable
 static int get_rl_variable(lua_State* state)
 {
     // Check we've got at least one string argument.
@@ -851,6 +294,8 @@ static int get_rl_variable(lua_State* state)
 }
 
 //------------------------------------------------------------------------------
+/// -name:  clink.is_rl_variable_true
+/// -deprecated: rl.isvariabletrue
 static int is_rl_variable_true(lua_State* state)
 {
     int i;
@@ -871,6 +316,10 @@ static int is_rl_variable_true(lua_State* state)
 }
 
 //------------------------------------------------------------------------------
+/// -name:  clink.get_host_process
+/// -deprecated:
+/// Always returns "clink"; this corresponds to the "clink" word in the
+/// <code>$if clink</code> directives in Readline's .inputrc file.
 static int get_host_process(lua_State* state)
 {
     lua_pushstring(state, rl_readline_name);
@@ -878,27 +327,21 @@ static int get_host_process(lua_State* state)
 }
 
 //------------------------------------------------------------------------------
-/// -name:  clink.split
-/// -deprecated: string.explode
-/// -arg:   str:string
-/// -arg:   sep:string
-/// -ret:   table
+/// -name:  clink.get_screen_info
+/// -deprecated: os.getscreeninfo
+/// <strong>Note:</strong> The field names are different between
+/// <code>os.getscreeninfo()</code> and the v0.4.9 implementation of
+/// <code>clink.get_screen_info</code>.
+static int get_screen_info(lua_State* state)
+{
+    return get_screen_info_impl(state, true/*back_compat*/);
+}
 
 
 
 // END -- Clink 0.4.8 API compatibility ----------------------------------------
 
 
-
-//------------------------------------------------------------------------------
-/// -name:  clink.match_display_filter
-/// -deprecated: builder:addmatch
-/// -var:   function
-/// This is no longer used.
-/// -show:  clink.match_display_filter = function(matches)
-/// -show:  &nbsp; -- Transform matches.
-/// -show:  &nbsp; return matches
-/// -show:  end
 
 //------------------------------------------------------------------------------
 static int map_string(lua_State* state, transform_mode mode)
@@ -950,6 +393,7 @@ static int map_string(lua_State* state, transform_mode mode)
 /// This API correctly converts UTF8 strings to lowercase, with international
 /// linguistic awareness.
 /// -show:  clink.lower("Hello World") -- returns "hello world"
+/// -show:  clink.lower("ÁÈÏõû")       -- returns "áèïõû"
 static int to_lowercase(lua_State* state)
 {
     return map_string(state, transform_mode::lower);
@@ -963,9 +407,56 @@ static int to_lowercase(lua_State* state)
 /// This API correctly converts UTF8 strings to uppercase, with international
 /// linguistic awareness.
 /// -show:  clink.upper("Hello World") -- returns "HELLO WORLD"
+/// -show:  clink.lower("áèïÕÛ")       -- returns "ÁÈÏÕÛ"
 static int to_uppercase(lua_State* state)
 {
     return map_string(state, transform_mode::upper);
+}
+
+//------------------------------------------------------------------------------
+static struct popup_del_callback_info
+{
+    lua_State*      m_state = nullptr;
+    int             m_ref = LUA_REFNIL;
+
+    bool empty() const
+    {
+        return !m_state || m_ref == LUA_REFNIL;
+    }
+
+    bool init(lua_State* state, int idx)
+    {
+        assert(!m_state);
+        m_ref = luaL_ref(state, LUA_REGISTRYINDEX);
+        if (m_ref != LUA_REFNIL)
+            m_state = state;
+        return !empty();
+    }
+
+    void clear()
+    {
+        if (m_state && m_ref != LUA_REFNIL)
+            luaL_unref(m_state, LUA_REGISTRYINDEX, m_ref);
+        m_state = nullptr;
+        m_ref = LUA_REFNIL;
+    }
+
+    bool call(int index)
+    {
+        if (empty())
+            return false;
+        lua_rawgeti(m_state, LUA_REGISTRYINDEX, m_ref);
+        lua_pushinteger(m_state, index + 1);
+        if (lua_state::pcall(m_state, 1, 1) != 0)
+            return false;
+        return lua_toboolean(m_state, -1);
+    }
+} s_del_callback_info;
+
+//------------------------------------------------------------------------------
+static bool popup_del_callback(int index)
+{
+    return s_del_callback_info.call(index);
 }
 
 //------------------------------------------------------------------------------
@@ -974,6 +465,7 @@ static int to_uppercase(lua_State* state)
 /// -arg:   title:string
 /// -arg:   items:table
 /// -arg:   [index:integer]
+/// -arg:   [del_callback:function]
 /// -ret:   string, boolean, integer
 /// Displays a popup list and returns the selected item.  May only be used
 /// within a <a href="#luakeybindings">luafunc: key binding</a>.
@@ -985,15 +477,23 @@ static int to_uppercase(lua_State* state)
 /// <span class="arg">index</span> optionally specifies the default item (or 1
 /// if omitted).
 ///
+/// <span class="arg">del_callback</span> optionally specifies a callback
+/// function to be called when <kbd>Del</kbd> is pressed.  The function receives
+/// the index of the selected item.  If the function returns true then the item
+/// is deleted from the popup list.  This requires Clink v1.3.41 or higher.
+///
 /// The function returns one of the following:
 /// <ul>
 /// <li>nil if the popup is canceled or an error occurs.
+/// <li>Three values:
+/// <ul>
 /// <li>string indicating the <code>value</code> field from the selected item
 /// (or the <code>display</code> field if no value field is present).
 /// <li>boolean which is true if the item was selected with <kbd>Shift</kbd> or
 /// <kbd>Ctrl</kbd> pressed.
 /// <li>integer indicating the index of the selected item in the original
 /// <span class="arg">items</span> table.
+/// </ul>
 /// </ul>
 ///
 /// Alternatively, the <span class="arg">items</span> argument can be a table of
@@ -1015,14 +515,42 @@ static int to_uppercase(lua_State* state)
 /// The optional <code>description</code> field is displayed in a dimmed color
 /// in a second column.  If it contains tab characters (<code>"\t"</code>) the
 /// description string is split into multiple columns (up to 3).
+///
+/// Starting in v1.3.18, if any description contains a tab character, then the
+/// descriptions are automatically aligned in a column.
+///
+/// Otherwise, the descriptions follow immediately after the display field.
+/// They can be aligned in a column by making all of the display fields be the
+/// same number of character cells.
+///
+/// Starting in v1.4.0, the <span class="arg">items</span> table may optionally
+/// include any of the following fields to customize the popup list.  The color
+/// strings must be
+/// <a href="https://en.wikipedia.org/wiki/ANSI_escape_code#SGR">SGR parameters</a>
+/// and will be automatically converted into the corresponding ANSI escape code.
+/// -show:  {
+/// -show:  &nbsp;   height          = 20,       -- Preferred height, not counting the border.
+/// -show:  &nbsp;   width           = 60,       -- Preferred width, not counting the border.
+/// -show:  &nbsp;   reverse         = true,     -- Start at bottom; search upwards.
+/// -show:  &nbsp;   colors = {                  -- Override the popup colors using any colors in this table.
+/// -show:  &nbsp;       items       = "97;44",  -- The items color (e.g. bright white on blue).
+/// -show:  &nbsp;       desc        = "...",    -- The description color.
+/// -show:  &nbsp;       border      = "...",    -- The border color (defaults to items color).
+/// -show:  &nbsp;       header      = "...",    -- The title color (defaults to border).
+/// -show:  &nbsp;       footer      = "...",    -- The footer message color (defaults to border color).
+/// -show:  &nbsp;       select      = "...",    -- The selected item color (defaults to reverse video of items color).
+/// -show:  &nbsp;       selectdesc  = "...",    -- The selected item description color (defaults to selected item color).
+/// -show:  &nbsp;   }
+/// -show:  }
 static int popup_list(lua_State* state)
 {
     if (!lua_state::is_in_luafunc())
         return luaL_error(state, "clink.popuplist may only be used in a " LUA_QL("luafunc:") " key binding");
 
-    enum arg_indices { makevaluesonebased, argTitle, argItems, argIndex};
+    enum arg_indices { makevaluesonebased, argTitle, argItems, argIndex, argDelCallback};
 
     const char* title = checkstring(state, argTitle);
+    const bool has_index = !lua_isnoneornil(state, argIndex);
     int index = optinteger(state, argIndex, 1) - 1;
     if (!title || !lua_istable(state, argItems))
         return 0;
@@ -1035,7 +563,9 @@ static int popup_list(lua_State* state)
     int top = lua_gettop(state);
 #endif
 
-    std::vector<autoptr<const char>> items;
+    std::vector<autoptr<const char>> free_items;
+    std::vector<const char*> items;
+    free_items.reserve(num_items);
     items.reserve(num_items);
     for (int i = 1; i <= num_items; ++i)
     {
@@ -1092,7 +622,9 @@ static int popup_list(lua_State* state)
             append_string_into_buffer(p, description, true/*allow_tabs*/);
         }
 
-        items.emplace_back(s.detach());
+        const char* p = s.detach();
+        free_items.emplace_back(p);
+        items.emplace_back(p);
 
         lua_pop(state, 1);
     }
@@ -1102,35 +634,148 @@ static int popup_list(lua_State* state)
     assert(num_items == items.size());
 #endif
 
-    const char* choice;
     if (index > items.size()) index = items.size();
     if (index < 0) index = 0;
 
-    popup_result result;
-    if (!g_gui_popups.get())
+    popup_config config;
+
+    if (lua_isfunction(state, argDelCallback))
     {
-        popup_results activate_text_list(const char* title, const char** entries, int count, int current, bool has_columns);
-        popup_results results = activate_text_list(title, &*items.begin(), int(items.size()), index, true/*has_columns*/);
-        result = results.m_result;
-        index = results.m_index;
-        choice = results.m_text.c_str();
-    }
-    else
-    {
-        result = do_popup_list(title, &*items.begin(), items.size(), 0, false, false, false, index, choice, popup_items_mode::display_filter);
+        lua_pushvalue(state, argDelCallback);
+        if (s_del_callback_info.init(state, -1))
+            config.del_callback = popup_del_callback;
     }
 
-    switch (result)
+    lua_pushliteral(state, "height");
+    lua_rawget(state, argItems);
+    if (lua_isnumber(state, -1))
+    {
+        int n = lua_tointeger(state, -1);
+        if (n > 0)
+            config.height = n;
+    }
+    lua_pop(state, 1);
+
+    lua_pushliteral(state, "width");
+    lua_rawget(state, argItems);
+    if (lua_isnumber(state, -1))
+    {
+        int n = lua_tointeger(state, -1);
+        if (n > 0)
+            config.width = n;
+    }
+    lua_pop(state, 1);
+
+    lua_pushliteral(state, "reverse");
+    lua_rawget(state, argItems);
+    config.reverse = lua_toboolean(state, -1);
+    if (config.reverse && !has_index)
+        index = num_items - 1;
+    lua_pop(state, 1);
+
+    lua_pushliteral(state, "colors");
+    lua_rawget(state, argItems);
+    if (lua_istable(state, -1))
+    {
+        const char* s;
+
+        lua_pushliteral(state, "items");
+        lua_rawget(state, -2);
+        if (s = lua_tostring(state, -1))
+            config.colors.items = s;
+        lua_pop(state, 1);
+
+        lua_pushliteral(state, "desc");
+        lua_rawget(state, -2);
+        if (s = lua_tostring(state, -1))
+            config.colors.desc = s;
+        lua_pop(state, 1);
+
+        lua_pushliteral(state, "border");
+        lua_rawget(state, -2);
+        if (s = lua_tostring(state, -1))
+            config.colors.border = s;
+        lua_pop(state, 1);
+
+        lua_pushliteral(state, "header");
+        lua_rawget(state, -2);
+        if (s = lua_tostring(state, -1))
+            config.colors.header = s;
+        lua_pop(state, 1);
+
+        lua_pushliteral(state, "footer");
+        lua_rawget(state, -2);
+        if (s = lua_tostring(state, -1))
+            config.colors.footer = s;
+        lua_pop(state, 1);
+
+        lua_pushliteral(state, "select");
+        lua_rawget(state, -2);
+        if (s = lua_tostring(state, -1))
+            config.colors.select = s;
+        lua_pop(state, 1);
+
+        lua_pushliteral(state, "selectdesc");
+        lua_rawget(state, -2);
+        if (s = lua_tostring(state, -1))
+            config.colors.selectdesc = s;
+        lua_pop(state, 1);
+    }
+    lua_pop(state, 1);
+
+    const popup_results results = activate_text_list(title, &*items.begin(), int(items.size()), index, true/*has_columns*/, &config);
+
+    s_del_callback_info.clear();
+
+    switch (results.m_result)
     {
     case popup_result::select:
     case popup_result::use:
-        lua_pushstring(state, choice);
-        lua_pushboolean(state, (result == popup_result::use));
-        lua_pushinteger(state, index + 1);
+        lua_pushlstring(state, results.m_text.c_str(), results.m_text.length());
+        lua_pushboolean(state, (results.m_result == popup_result::select));
+        lua_pushinteger(state, results.m_index + 1);
         return 3;
     }
 
     return 0;
+}
+
+//------------------------------------------------------------------------------
+/// -name:  clink.getpopuplistcolors
+/// -ver:   1.4.0
+/// -ret:   table
+/// Returns the default popup colors in a table with the following scheme:
+/// -show:  {
+/// -show:      items   = "...",    -- The SGR parameters for the items color.
+/// -show:      desc    = "...",    -- The SGR parameters for the description color.
+/// -show:  }
+static int get_popup_list_colors(lua_State* state)
+{
+    struct table_t {
+        const char* name;
+        const char* value;
+    };
+
+    lua_createtable(state, 0, 4);
+    {
+        struct table_t table[] = {
+            { "items", get_popup_colors() },
+            { "desc", get_popup_desc_colors() },
+        };
+
+        for (unsigned int i = 0; i < sizeof_array(table); ++i)
+        {
+            const char* value = table[i].value;
+            if (value[0] == '0' && value[1] == ';')
+                value += 2;
+            lua_pushstring(state, table[i].name);
+            lua_pushstring(state, value);
+            lua_rawset(state, -3);
+        }
+    }
+
+    return 1;
+
 }
 
 //------------------------------------------------------------------------------
@@ -1177,6 +822,7 @@ static int get_session(lua_State* state)
 /// <tr><td>"ansicon"</td><td>Clink thinks ANSI escape codes will be handled by ANSICON.</td></tr>
 /// <tr><td>"winterminal"</td><td>Clink thinks ANSI escape codes will be handled by Windows
 ///     Terminal.</td></tr>
+/// <tr><td>"wezterm"</td><td>Clink thinks ANSI escape codes will be handled by WezTerm.</td></tr>
 /// <tr><td>"winconsole"</td><td>Clink thinks ANSI escape codes will be handled by the default
 ///     console support in Windows, but Clink detected a terminal replacement that won't support 256
 ///     color or 24 bit color.</td></tr>
@@ -1193,6 +839,7 @@ static int get_ansi_host(lua_State* state)
         "conemu",
         "ansicon",
         "winterminal",
+        "wezterm",
         "winconsolev2",
         "winconsole",
     };
@@ -1270,10 +917,12 @@ static int translate_slashes(lua_State* state)
 /// -deprecated: clink.translateslashes
 /// -arg:   type:integer
 /// Controls how Clink will translate the path separating slashes for the
-/// current path being completed. Values for <span class="arg">type</span> are;</br>
-/// -1 - no translation</br>
-/// 0 - to backslashes</br>
-/// 1 - to forward slashes
+/// current path being completed. Values for <span class="arg">type</span> are;
+/// <ul>
+/// <li>-1 - no translation</li>
+/// <li>0 - to backslashes</li>
+/// <li>1 - to forward slashes</li>
+/// </ul>
 static int slash_translation(lua_State* state)
 {
     if (lua_gettop(state) == 0)
@@ -1309,7 +958,11 @@ static int reload(lua_State* state)
 /// Reclassify the input line text again and refresh the input line display.
 static int reclassify_line(lua_State* state)
 {
-    host_reclassify(reclassify_reason::force);
+    const bool ismain = (G(state)->mainthread == state);
+    if (ismain)
+        host_reclassify(reclassify_reason::force);
+    else
+        lua_input_idle::signal_reclassify();
     return 0;
 }
 
@@ -1319,13 +972,88 @@ static int reclassify_line(lua_State* state)
 /// Invoke the prompt filters again and refresh the prompt.
 ///
 /// Note: this can potentially be expensive; call this only infrequently.
+extern bool g_filtering_in_progress;
 int g_prompt_refilter = 0;
 static int refilter_prompt(lua_State* state)
 {
+    if (g_filtering_in_progress)
+        return luaL_error(state, "clink.refilterprompt may not be used within a prompt filter.");
+
     g_prompt_refilter++;
     void host_filter_prompt();
     host_filter_prompt();
     return 0;
+}
+
+//------------------------------------------------------------------------------
+/// -name:  clink.refilterafterterminalresize
+/// -ver:   1.4.0
+/// -arg:   refilter:boolean
+/// -ret:   boolean
+/// Call this with <span class="arg">refilter</span> either nil or true to make
+/// Clink automatically rerun prompt filters after the terminal is resized.  The
+/// previous value is returned.
+///
+/// On Windows the terminal is resized while the console program in the terminal
+/// (such as CMD) continues to run.  If a console program writes to the terminal
+/// while the resize is happening, then the terminal display can become garbled.
+/// So Clink waits until the terminal has stayed the same size for at least 1.5
+/// seconds, and then it reruns the prompt filters.
+///
+/// <strong>Use this with caution:</strong>  if the prompt filters have not been
+/// designed efficiently, then rerunning them after resizing the terminal could
+/// cause responsiveness problems.  Also, if the terminal is resized again while
+/// the prompt filters are being rerun, then the terminal display may become
+/// garbled.
+static int refilter_after_terminal_resize(lua_State* state)
+{
+    bool refilter = true;
+    if (!lua_isnoneornil(state, 1))
+        refilter = lua_toboolean(state, 1);
+
+    set_refilter_after_resize(refilter);
+    return 0;
+}
+
+//------------------------------------------------------------------------------
+/// -name:  clink.parseline
+/// -ver:   1.3.37
+/// -arg:   line:string
+/// -ret:   table
+/// This parses the <span class="arg">line</span> string into a table of
+/// commands, with one <a href="#line_state">line_state</a> for each command
+/// parsed from the line string.
+///
+/// The returned table of tables has the following scheme:
+/// -show:  local commands = clink.parseline("echo hello & echo world")
+/// -show:  -- commands[1].line_state corresponds to "echo hello".
+/// -show:  -- commands[2].line_state corresponds to "echo world".
+static int parse_line(lua_State* state)
+{
+    const char* line = checkstring(state, 1);
+    if (!line)
+        return 0;
+
+    // A word collector is lightweight, and there is currently no need to
+    // support tokenisers for anything other than CMD.  So just create a
+    // temporary one here.
+    cmd_command_tokeniser command_tokeniser;
+    cmd_word_tokeniser word_tokeniser;
+    word_collector collector(&command_tokeniser, &word_tokeniser, "\"");
+
+    // Collect words from the whole line.
+    std::vector<word> tmp_words;
+    unsigned int len = static_cast<unsigned int>(strlen(line));
+    collector.collect_words(line, len, 0, tmp_words, collect_words_mode::whole_command);
+
+    // Group words into one line_state per command.
+    commands commands;
+    commands.set(line, len, 0, tmp_words);
+
+    // Make a deep copy in an object allocated in the Lua heap.  Garbage
+    // collection will free it.
+    line_states_lua::make_new(state, commands.get_linestates(line, len));
+    return 1;
 }
 
 //------------------------------------------------------------------------------
@@ -1441,20 +1169,6 @@ static int kick_idle(lua_State* state)
 
 //------------------------------------------------------------------------------
 // UNDOCUMENTED; internal use only.
-static int matches_ready(lua_State* state)
-{
-    bool isnum;
-    int id = checkinteger(state, 1, &isnum);
-    if (!isnum)
-        return 0;
-
-    extern bool notify_matches_ready(int generation_id);
-    lua_pushboolean(state, notify_matches_ready(id));
-    return 1;
-}
-
-//------------------------------------------------------------------------------
-// UNDOCUMENTED; internal use only.
 static int recognize_command(lua_State* state)
 {
     const char* line = checkstring(state, 1);
@@ -1469,6 +1183,204 @@ static int recognize_command(lua_State* state)
     const recognition recognized = recognize_command(line, word, quoted, ready, nullptr/*file*/);
     lua_pushinteger(state, int(recognized));
     return 1;
+}
+
+//------------------------------------------------------------------------------
+static str_unordered_map<int> s_cached_path_type;
+static linear_allocator s_cached_path_store(2048);
+static std::recursive_mutex s_cached_path_type_mutex;
+void clear_path_type_cache()
+{
+    std::lock_guard<std::recursive_mutex> lock(s_cached_path_type_mutex);
+    s_cached_path_type.clear();
+    s_cached_path_store.clear();
+}
+void add_cached_path_type(const char* full, int type)
+{
+    std::lock_guard<std::recursive_mutex> lock(s_cached_path_type_mutex);
+    dbg_ignore_scope(snapshot, "add_cached_path_type");
+    unsigned int size = static_cast<unsigned int>(strlen(full) + 1);
+    char* key = static_cast<char*>(s_cached_path_store.alloc(size));
+    memcpy(key, full, size);
+    s_cached_path_type.emplace(key, type);
+}
+bool get_cached_path_type(const char* full, int& type)
+{
+    std::lock_guard<std::recursive_mutex> lock(s_cached_path_type_mutex);
+    const auto& iter = s_cached_path_type.find(full);
+    if (iter == s_cached_path_type.end())
+        return false;
+    type = iter->second;
+    return true;
+}
+
+//------------------------------------------------------------------------------
+class path_type_async_lua_task : public async_lua_task
+{
+public:
+    path_type_async_lua_task(const char* key, const char* src, const char* path)
+    : async_lua_task(key, src)
+    , m_path(path)
+    {}
+
+    int get_path_type() const { return m_type; }
+
+protected:
+    void do_work() override
+    {
+        m_type = os::get_path_type(m_path.c_str());
+        add_cached_path_type(m_path.c_str(), m_type);
+    }
+
+private:
+    str_moveable m_path;
+    int m_type = os::path_type_invalid;
+};
+
+//------------------------------------------------------------------------------
+// UNDOCUMENTED; internal use only.
+static int async_path_type(lua_State* state)
+{
+    const char* path = checkstring(state, 1);
+    int timeout = optinteger(state, 2, 0);
+    if (!path || !*path)
+        return 0;
+
+    str<280> full;
+    os::get_full_path_name(path, full);
+
+    int type;
+    if (!get_cached_path_type(full.c_str(), type))
+    {
+        str_moveable key;
+        key.format("async||%s", full.c_str());
+        std::shared_ptr<async_lua_task> task = find_async_lua_task(key.c_str());
+        bool created = !task;
+        if (!task)
+        {
+            str<> src;
+            get_lua_srcinfo(state, src);
+
+            task = std::make_shared<path_type_async_lua_task>(key.c_str(), src.c_str(), full.c_str());
+            if (task && lua_isfunction(state, 3))
+            {
+                lua_pushvalue(state, 3);
+                int ref = luaL_ref(state, LUA_REGISTRYINDEX);
+                task->set_callback(std::make_shared<callback_ref>(ref));
+            }
+
+            add_async_lua_task(task);
+        }
+
+        if (timeout)
+            WaitForSingleObject(task->get_wait_handle(), timeout);
+
+        if (!task->is_complete())
+            return 0;
+
+        std::shared_ptr<path_type_async_lua_task> pt_task = std::dynamic_pointer_cast<path_type_async_lua_task>(task);
+        if (!pt_task)
+            return 0;
+
+        pt_task->disable_callback();
+
+        type = pt_task->get_path_type();
+    }
+
+    const char* ret = nullptr;
+    switch (type)
+    {
+    case os::path_type_file:    ret = "file"; break;
+    case os::path_type_dir:     ret = "dir"; break;
+    default:                    return 0;
+    }
+
+    lua_pushstring(state, ret);
+    return 1;
+}
+
+//------------------------------------------------------------------------------
+/// -name:  clink.recognizecommand
+/// -ver:   1.3.38
+/// -arg:   [line:string]
+/// -arg:   word:string
+/// -arg:   [quoted:boolean]
+/// -ret:   word_class:string, ready:boolean, file:string
+/// This reports the input line coloring word classification to use for a
+/// command word.  The return value can be passed into
+/// <a href="#word_classifications:classifyword">word_classifications:classifyword()</a>
+/// as its <span class="arg">word_class</span> argument.
+///
+/// This is intended for advanced input line coloring purposes.  For example if
+/// a script uses <a href="#clink.onfilterinput">clink.onfilterinput()</a> to
+/// modify the input text, then it can use this function inside a custom
+/// <a href="#classifier_override_line">classifier</a> to look up the color
+/// appropriate for the modified input text.
+///
+/// The <span class="arg">line</span> is optional and may be an empty string or
+/// omitted.  When present, it is parsed to check if it would be processed as a
+/// <a href="#directory-shortcuts">directory shortcut</a>.
+///
+/// The <span class="arg">word</span> is a string indicating the word to be
+/// analyzed.
+///
+/// The <span class="arg">quoted</span> is optional.  When true, it indicates
+/// the word is quoted and any <code>^</code> characters are taken as-is,
+/// rather than treating them as the usual CMD escape character.
+///
+/// The possible return values for <span class="arg">word_class</span> are:
+///
+/// <table>
+/// <tr><th>Code</th><th>Classification</th><th>Clink Color Setting</th></tr>
+/// <tr><td><code>"x"</code></td><td>Executable; used for the first word when it is not a command or doskey alias, but is an executable name that exists.</td><td><code>color.executable</code></td></tr>
+/// <tr><td><code>"u"</code></td><td>Unrecognized; used for the first word when it is not a command, doskey alias, or recognized executable name.</td><td><code>color.unrecognized</code></td></tr>
+/// <tr><td><code>"o"</code></td><td>Other; used for file names and words that don't fit any of the other classifications.</td><td><code>color.input</code></td></tr>
+/// </table>
+///
+/// The possible return values for <span class="arg">ready</span> are:
+///
+/// <ul>
+/// <li>True if the analysis has completed.</li>
+/// <li>False if the analysis has not yet completed (and the returned word class
+/// may be a temporary placeholder).</li>
+/// </ul>
+///
+/// The return value for <span class="arg">file</span> is the fully qualified
+/// path to the found executable file, if any, or nil.
+///
+/// <strong>Note:</strong>  This always returns immediately, and it uses a
+/// background thread to analyze the <span class="arg">word</span> asynchronously.
+/// When the background thread finishes analyzing the word, Clink automatically
+/// redisplays the input line, giving classifiers a chance to call this function
+/// again and get the final <span class="arg">word_class</span> result.
+static int api_recognize_command(lua_State* state)
+{
+    int iword = lua_isstring(state, 2) ? 2 : 1;
+    int iline = iword - 1;
+    const char* line = (iline < 1 || lua_isnil(state, iline)) ? "" : checkstring(state, iline);
+    const char* word = checkstring(state, iword);
+    const bool quoted = lua_toboolean(state, iword + 1);
+    if (iline > 0 && (!line || !*line))
+        return 0;
+    if (!word || !*word)
+        return 0;
+
+    bool ready;
+    str<> file;
+    const recognition recognized = recognize_command(line, word, quoted, ready, &file);
+
+    char cl = 'o';
+    if (int(recognized) < 0)
+        cl = 'u';
+    else if (int(recognized) > 0)
+        cl = 'x';
+    lua_pushlstring(state, &cl, 1);
+    lua_pushboolean(state, ready);
+    if (file.empty())
+        lua_pushnil(state);
+    else
+        lua_pushlstring(state, file.c_str(), file.length());
+    return 3;
 }
 
 //------------------------------------------------------------------------------
@@ -1520,6 +1432,14 @@ static int generate_from_history(lua_State* state)
 }
 
 //------------------------------------------------------------------------------
+static int api_reset_generate_matches(lua_State* state)
+{
+    extern void reset_generate_matches();
+    reset_generate_matches();
+    return 0;
+}
+
+//------------------------------------------------------------------------------
 static int mark_deprecated_argmatcher(lua_State* state)
 {
     const char* name = checkstring(state, 1);
@@ -1529,9 +1449,9 @@ static int mark_deprecated_argmatcher(lua_State* state)
 }
 
 //------------------------------------------------------------------------------
-static int invalidate_matches(lua_State* state)
+static int signal_delayed_init(lua_State* state)
 {
-    host_invalidate_matches();
+    lua_input_idle::signal_delayed_init();
     return 0;
 }
 
@@ -1546,6 +1466,155 @@ static int is_cmd_command(lua_State* state)
     return 1;
 }
 
+//------------------------------------------------------------------------------
+static int get_installation_type(lua_State* state)
+{
+    // Open the Uninstall key.
+
+    HKEY hkey;
+    wstr<> where(c_uninstall_key);
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, where.c_str(), 0, MAXIMUM_ALLOWED, &hkey))
+    {
+failed:
+        lua_pushliteral(state, "zip");
+        return 1;
+    }
+
+    // Get binaries path.
+
+    WCHAR long_bin_dir[MAX_PATH * 2];
+    {
+        str<> tmp;
+        if (!os::get_env("=clink.bin", tmp))
+            goto failed;
+
+        wstr<> bin_dir(tmp.c_str());
+        DWORD len = GetLongPathNameW(bin_dir.c_str(), long_bin_dir, sizeof_array(long_bin_dir));
+        if (!len || len >= sizeof_array(long_bin_dir))
+            goto failed;
+
+        long_bin_dir[len] = '\0';
+    }
+
+    // Enumerate installed programs.
+
+    bool found = false;
+    WCHAR install_key[MAX_PATH];
+    install_key[0] = '\0';
+
+    for (DWORD index = 0; true; ++index)
+    {
+        DWORD size = sizeof_array(install_key); // Characters, not bytes, for RegEnumKeyExW.
+        if (ERROR_NO_MORE_ITEMS == RegEnumKeyExW(hkey, index, install_key, &size, 0, nullptr, nullptr, nullptr))
+            break;
+
+        if (size >= sizeof_array(install_key))
+            size = sizeof_array(install_key) - 1;
+        install_key[size] = '\0';
+
+        // Ignore if not a Clink installation.
+        if (_wcsnicmp(install_key, L"clink_", 6))
+            continue;
+
+        HKEY hsubkey;
+        if (RegOpenKeyExW(hkey, install_key, 0, MAXIMUM_ALLOWED, &hsubkey))
+            continue;
+
+        DWORD type;
+        WCHAR location[280];
+        DWORD len = sizeof(location); // Bytes, not characters, for RegQueryValueExW.
+        LSTATUS status = RegQueryValueExW(hsubkey, L"InstallLocation", NULL, &type, LPBYTE(&location), &len);
+        RegCloseKey(hsubkey);
+
+        if (status)
+            continue;
+
+        len = len / 2;
+        if (len >= sizeof_array(location))
+            continue;
+        location[len] = '\0';
+
+        // If the uninstall location matches the current binaries directory,
+        // then this is a match.
+        WCHAR long_location[MAX_PATH * 2];
+        len = GetLongPathNameW(location, long_location, sizeof_array(long_location));
+        if (len && len < sizeof_array(long_location) && !_wcsicmp(long_bin_dir, long_location))
+        {
+            found = true;
+            break;
+        }
+    }
+
+    RegCloseKey(hkey);
+
+    if (!found)
+        goto failed;
+
+    str<> tmp(install_key);
+    lua_pushliteral(state, "exe");
+    lua_pushstring(state, tmp.c_str());
+    return 2;
+}
+
+//------------------------------------------------------------------------------
+static int set_install_version(lua_State* state)
+{
+    const char* key = checkstring(state, 1);
+    const char* ver = checkstring(state, 2);
+    if (!key || !ver || _strnicmp(key, "clink_", 6))
+        return 0;
+
+    if (ver[0] == 'v')
+        ver++;
+
+    wstr<> where(c_uninstall_key);
+    wstr<> wkey(key);
+    where << L"\\" << wkey.c_str();
+
+    HKEY hkey;
+    LSTATUS status = RegOpenKeyExW(HKEY_LOCAL_MACHINE, where.c_str(), 0, MAXIMUM_ALLOWED, &hkey);
+    if (status)
+        return 0;
+
+    wstr<> name;
+    wstr<> version(ver);
+    name << L"Clink v" << version.c_str();
+
+    bool ok = true;
+    ok = ok && !RegSetValueExW(hkey, L"DisplayName", 0, REG_SZ, reinterpret_cast<const BYTE*>(name.c_str()), (name.length() + 1) * sizeof(*name.c_str()));
+    ok = ok && !RegSetValueExW(hkey, L"DisplayVersion", 0, REG_SZ, reinterpret_cast<const BYTE*>(version.c_str()), (version.length() + 1) * sizeof(*version.c_str()));
+    RegCloseKey(hkey);
+
+    if (!ok)
+        return 0;
+
+    lua_pushboolean(state, true);
+    return 1;
+}
+
+//------------------------------------------------------------------------------
+#if defined(DEBUG) && defined(_MSC_VER)
+static int last_allocation_number(lua_State* state)
+{
+    lua_pushinteger(state, dbggetallocnumber());
+    return 1;
+}
+#endif
+
+//------------------------------------------------------------------------------
+#ifdef TRACK_LOADED_LUA_FILES
+static int clink_is_lua_file_loaded(lua_State* state)
+{
+    const char* filename = checkstring(state, 1);
+    if (!filename)
+        return 0;
+
+    int loaded = is_lua_file_loaded(state, filename);
+    lua_pushboolean(state, loaded);
+    return 1;
+}
+#endif
+
 
 
 //------------------------------------------------------------------------------
@@ -1554,7 +1623,6 @@ extern int get_aliases(lua_State* state);
 extern int get_current_dir(lua_State* state);
 extern int get_env(lua_State* state);
 extern int get_env_names(lua_State* state);
-extern int get_screen_info(lua_State* state);
 extern int is_dir(lua_State* state);
 extern int explode(lua_State* state);
 
@@ -1570,12 +1638,16 @@ void clink_lua_initialise(lua_state& lua)
         { "print",                  &clink_print },
         { "upper",                  &to_uppercase },
         { "popuplist",              &popup_list },
+        { "getpopuplistcolors",     &get_popup_list_colors },
         { "getsession",             &get_session },
         { "getansihost",            &get_ansi_host },
         { "translateslashes",       &translate_slashes },
         { "reload",                 &reload },
         { "reclassifyline",         &reclassify_line },
         { "refilterprompt",         &refilter_prompt },
+        { "refilterafterterminalresize", &refilter_after_terminal_resize },
+        { "parseline",              &parse_line },
+        { "recognizecommand",       &api_recognize_command },
         // Backward compatibility with the Clink 0.4.8 API.  Clink 1.0.0a1 had
         // moved these APIs away from "clink.", but backward compatibility
         // requires them here as well.
@@ -1602,12 +1674,21 @@ void clink_lua_initialise(lua_state& lua)
         { "history_suggester",      &history_suggester },
         { "set_suggestion_result",  &set_suggestion_result },
         { "kick_idle",              &kick_idle },
-        { "matches_ready",          &matches_ready },
         { "_recognize_command",     &recognize_command },
+        { "_async_path_type",       &async_path_type },
         { "_generate_from_history", &generate_from_history },
+        { "_reset_generate_matches", &api_reset_generate_matches },
         { "_mark_deprecated_argmatcher", &mark_deprecated_argmatcher },
-        { "_invalidate_matches",    &invalidate_matches },
+        { "_signal_delayed_init",   &signal_delayed_init },
         { "is_cmd_command",         &is_cmd_command },
+        { "_get_installation_type", &get_installation_type },
+        { "_set_install_version",   &set_install_version },
+#if defined(DEBUG) && defined(_MSC_VER)
+        { "last_allocation_number", &last_allocation_number },
+#endif
+#ifdef TRACK_LOADED_LUA_FILES
+        { "is_lua_file_loaded",     &clink_is_lua_file_loaded },
+#endif
     };
 
     lua_State* state = lua.get_state();
@@ -1621,22 +1702,33 @@ void clink_lua_initialise(lua_state& lua)
         lua_rawset(state, -3);
     }
 
+    lua_pushliteral(state, "version_encoded");
     lua_pushinteger(state, CLINK_VERSION_MAJOR * 10000000 +
                            CLINK_VERSION_MINOR *    10000 +
                            CLINK_VERSION_PATCH);
-    lua_setfield(state, -2, "version_encoded");
+    lua_rawset(state, -3);
+
+    lua_pushliteral(state, "version_major");
     lua_pushinteger(state, CLINK_VERSION_MAJOR);
-    lua_setfield(state, -2, "version_major");
+    lua_rawset(state, -3);
+
+    lua_pushliteral(state, "version_minor");
     lua_pushinteger(state, CLINK_VERSION_MINOR);
-    lua_setfield(state, -2, "version_minor");
+    lua_rawset(state, -3);
+
+    lua_pushliteral(state, "version_patch");
     lua_pushinteger(state, CLINK_VERSION_PATCH);
-    lua_setfield(state, -2, "version_patch");
+    lua_rawset(state, -3);
+
+    lua_pushliteral(state, "version_commit");
     lua_pushstring(state, AS_STR(CLINK_COMMIT));
-    lua_setfield(state, -2, "version_commit");
+    lua_rawset(state, -3);
+
 
 #ifdef DEBUG
+    lua_pushliteral(state, "DEBUG");
     lua_pushboolean(state, true);
-    lua_setfield(state, -2, "DEBUG");
+    lua_rawset(state, -3);
 #endif
 
     lua_setglobal(state, "clink");

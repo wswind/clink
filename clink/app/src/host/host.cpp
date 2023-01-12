@@ -110,6 +110,62 @@ setting_bool g_save_history(
     "Changing this setting only takes effect for new instances.",
     true);
 
+static setting_enum g_directories_dupe_mode(
+    "directories.dupe_mode",
+    "Controls duplicates in directory history",
+    "Controls how the current directory history is updated.  A value of 'add' (the\n"
+    "default) always adds the current directory to the directory history.  A value\n"
+    "of 'erase_prev' will erase any previous entries for the current directory and\n"
+    "then add it to the directory history.\n"
+    "Note that directory history is not saved between sessions.",
+    "add,erase_prev",
+    0);
+
+setting_enum g_history_timestamp(
+    "history.time_stamp",
+    "History item timestamps",
+    "The default is 'off'.  When set to 'save', timestamps are saved for each\n"
+    "history item but are only shown in the 'history' command when the\n"
+    "'--show-time' flag is used.  When set to 'show', timestamps are saved and\n"
+    "are shown in 'history' unless the '--bare' flag is used.",
+    "off,save,show",
+    0);
+
+setting_str g_history_timeformat(
+    "history.time_format",
+    "Format for showing history times",
+    "This specifies a format string to override the default string (\"%F %T  \")\n"
+    "for showing timestamps for history items.  Timestamps are shown when the\n"
+    "'history.show_time' setting is enabled.  This can be overridden by flags in\n"
+    "the 'history' command."
+    "\n"
+    "The format string may contain regular characters and special format\n"
+    "specifiers.  Format specifiers begin with a percent sign (%), and are expanded\n"
+    "to their corresponding values.  For a list of possible format specifiers,\n"
+    "refer to the C++ strftime() documentation.\n"
+    "\n"
+    "Some common format specifiers are:\n"
+    "  %a    Abbreviated weekday name for the locale (e.g. Thu).\n"
+    "  %b    Abbreviated month name for the locale (e.g. Aug).\n"
+    "  %c    Date and time representation for the locale.\n"
+    "  %D    Short MM/DD/YY date (e.g. 08/23/01).\n"
+    "  %F    Short YYYY/MM/DD date (e.g. 2001-08-23).\n"
+    "  %H    Hour in 24-hour format (00 - 23).\n"
+    "  %I    Hour in 12-hour format (01 - 12).\n"
+    "  %m    Month (01 - 12).\n"
+    "  %M    Minutes (00 - 59).\n"
+    "  %p    AM or PM indicator for the locale.\n"
+    "  %r    12-hour clock time for the locale (e.g. 02:55:41 pm).\n"
+    "  %R    24-hour clock time (e.g. 14:55).\n"
+    "  %S    Seconds (00 - 59).\n"
+    "  %T    ISO 8601 time format HH:MM:SS (e.g. 14:55:41).\n"
+    "  %x    Date representation for the locale.\n"
+    "  %X    Time representation for the locale.\n"
+    "  %y    Year without century (00 - 99).\n"
+    "  %Y    Year with century (e.g. 2001).\n"
+    "  %%    A % sign.",
+    "%F %T  ");
+
 static setting_str g_exclude_from_history_cmds(
     "history.dont_add_to_history_cmds",
     "Commands not automatically added to the history",
@@ -117,6 +173,15 @@ static setting_str g_exclude_from_history_cmds(
     "Commands are separated by spaces, commas, or semicolons.  Default is\n"
     "\"exit history\", to exclude both of those commands.",
     "exit history");
+
+setting_bool g_history_autoexpand(
+    "history.auto_expand",
+    "Perform history expansion automatically",
+    "When enabled, history expansion is automatically performed when a command\n"
+    "line is accepted (by pressing Enter).  When disabled, history expansion is\n"
+    "performed only when a corresponding expansion command is used (such as\n"
+    "'clink-expand-history' Alt-^, or 'clink-expand-line' Alt-Ctrl-E).",
+    true);
 
 static setting_bool g_reload_scripts(
     "lua.reload_scripts",
@@ -222,8 +287,31 @@ static void update_dir_history()
     str<> cwd;
     os::get_current_dir(cwd);
 
+    bool add = true;                    // 'add'
+    switch (g_directories_dupe_mode.get())
+    {
+    case 1:                             // 'erase_prev'
+        {
+            auto iter = s_dir_history.begin();
+            while (iter != s_dir_history.end())
+            {
+                auto next(iter);
+                ++next;
+                if (_stricmp(iter->get(), cwd.c_str()) == 0)
+                    s_dir_history.erase(iter);
+                iter = next;
+            }
+        }
+        break;
+    }
+
+    if (!s_dir_history.size())
+        add = true;
+    else if (add && _stricmp(s_dir_history.back().get(), cwd.c_str()) == 0)
+        add = false;
+
     // Add cwd to tail.
-    if (!s_dir_history.size() || _stricmp(s_dir_history.back().get(), cwd.c_str()) != 0)
+    if (add)
     {
         dbg_ignore_scope(snapshot, "History");
         s_dir_history.push_back(cwd.c_str());
@@ -246,6 +334,20 @@ static void prev_dir_history(str_base& inout)
     a++;
 
     inout.format(" cd /d \"%s\"", a->get());
+}
+
+//------------------------------------------------------------------------------
+bool host_remove_dir_history(int index)
+{
+    for (auto iter = s_dir_history.begin(); iter != s_dir_history.end(); ++iter, --index)
+    {
+        if (index == 0)
+        {
+            s_dir_history.erase(iter);
+            return true;
+        }
+    }
+    return false;
 }
 
 
@@ -349,7 +451,6 @@ host::~host()
     delete m_prompt_filter;
     delete m_suggester;
     delete m_lua;
-    delete m_history;
     delete m_printer;
     terminal_destroy(m_terminal);
 }
@@ -462,18 +563,6 @@ void host::pop_queued_line()
 {
     m_queued_lines.pop_front();
     m_char_cursor = 0;
-}
-
-//------------------------------------------------------------------------------
-int host::add_history(const char* line)
-{
-    return !!m_history->add(line);
-}
-
-//------------------------------------------------------------------------------
-int host::remove_history(int rl_history_index, const char* line)
-{
-    return !!m_history->remove(rl_history_index, line);
 }
 
 //------------------------------------------------------------------------------
@@ -859,10 +948,37 @@ skip_errorlevel:
     }
 #endif
 
-    line_editor::desc desc(m_terminal.in, m_terminal.out, m_printer, this);
-    initialise_editor_desc(desc);
+    // Initialize history before filtering the prompt, so that the Lua history
+    // APIs can work.
+    history_database* history = history_database::get();
+    if (init_history)
+    {
+        if (history &&
+            ((g_save_history.get() != history->has_bank(bank_master)) ||
+             history->is_stale_name()))
+        {
+            delete history;
+            history = nullptr;
+        }
+
+        if (!history)
+        {
+            dbg_ignore_scope(snapshot, "History");
+            str<> history_path;
+            app->get_history_path(history_path);
+            history = new history_database(history_path.c_str(), app->get_id(), g_save_history.get());
+        }
+
+        if (history)
+        {
+            history->initialise();
+            history->load_rl_history();
+        }
+    }
 
     // Filter the prompt.  Unless processing a multiline doskey macro.
+    line_editor::desc desc(m_terminal.in, m_terminal.out, m_printer, this);
+    initialise_editor_desc(desc);
     if (init_prompt)
     {
         m_prompt = prompt ? prompt : "";
@@ -872,7 +988,6 @@ skip_errorlevel:
 
     // Create the editor and add components to it.
     line_editor* editor = nullptr;
-
     if (init_editor)
     {
         editor = line_editor_create(desc);
@@ -880,29 +995,6 @@ skip_errorlevel:
         if (g_classify_words.get())
             editor->set_classifier(lua);
         editor->set_input_idle(lua);
-    }
-
-    if (init_history)
-    {
-        if (m_history &&
-            ((g_save_history.get() != m_history->has_bank(bank_master)) ||
-             m_history->is_stale_name()))
-        {
-            delete m_history;
-            m_history = 0;
-        }
-
-        if (!m_history)
-        {
-            dbg_ignore_scope(snapshot, "History");
-            m_history = new history_db(g_save_history.get());
-        }
-
-        if (m_history)
-        {
-            m_history->initialise();
-            m_history->load_rl_history();
-        }
     }
 
     bool resolved = false;
@@ -992,7 +1084,8 @@ skip_errorlevel:
 
         // Handle history event expansion.  expand() is a static method,
         // so can call it even when m_history is nullptr.
-        if (m_history->expand(out.c_str(), out) == history_db::expand_print)
+        if (g_history_autoexpand.get() &&
+            history->expand(out.c_str(), out) == history_db::expand_print)
         {
             puts(out.c_str());
             out.clear();
@@ -1028,8 +1121,9 @@ skip_errorlevel:
         }
 
         // Add the line to the history.
-        if (add_history)
-            m_history->add(out.c_str());
+        assert(history);
+        if (add_history && history)
+            history->add(out.c_str());
         break;
     }
 
@@ -1133,42 +1227,49 @@ skip_errorlevel:
 }
 
 //------------------------------------------------------------------------------
+bool g_filtering_in_progress = false;
 const char* host::filter_prompt(const char** rprompt, bool transient, bool final)
 {
     dbg_ignore_scope(snapshot, "Prompt filter");
 
-    m_filtered_prompt.clear();
-    m_filtered_rprompt.clear();
-    if (g_filter_prompt.get() && m_prompt_filter)
+    if (!g_filtering_in_progress)
     {
-        str_moveable tmp;
-        str_moveable rtmp;
-        const char* p;
-        const char* rp;
-        if (transient)
+        rollback<bool> rg_fip(g_filtering_in_progress, true);
+
+        m_filtered_prompt.clear();
+        m_filtered_rprompt.clear();
+        if (g_filter_prompt.get() && m_prompt_filter)
         {
-            prompt_utils::get_transient_prompt(tmp);
-            prompt_utils::get_transient_rprompt(rtmp);
-            p = tmp.c_str();
-            rp = rtmp.c_str();
+            str_moveable tmp;
+            str_moveable rtmp;
+            const char* p;
+            const char* rp;
+            if (transient)
+            {
+                prompt_utils::get_transient_prompt(tmp);
+                prompt_utils::get_transient_rprompt(rtmp);
+                p = tmp.c_str();
+                rp = rtmp.c_str();
+            }
+            else
+            {
+                p = m_prompt ? m_prompt : "";
+                rp = m_rprompt ? m_rprompt : "";
+            }
+            m_prompt_filter->filter(p,
+                                    rp,
+                                    m_filtered_prompt,
+                                    m_filtered_rprompt,
+                                    transient,
+                                    final);
         }
         else
         {
-            p = m_prompt ? m_prompt : "";
-            rp = m_rprompt ? m_rprompt : "";
+            m_filtered_prompt = m_prompt;
+            m_filtered_rprompt = m_rprompt;
         }
-        m_prompt_filter->filter(p,
-                                rp,
-                                m_filtered_prompt,
-                                m_filtered_rprompt,
-                                transient,
-                                final);
     }
-    else
-    {
-        m_filtered_prompt = m_prompt;
-        m_filtered_rprompt = m_rprompt;
-    }
+
     if (rprompt)
         *rprompt = m_filtered_rprompt.length() ? m_filtered_rprompt.c_str() : nullptr;
     return m_filtered_prompt.c_str();

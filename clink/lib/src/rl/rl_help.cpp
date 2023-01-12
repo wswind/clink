@@ -8,13 +8,15 @@
 #include <core/str.h>
 #include <core/str_unordered_set.h>
 #include <core/debugheap.h>
+#include <core/linear_allocator.h>
 #include <terminal/printer.h>
 #include <terminal/terminal.h>
 #include <terminal/terminal_helpers.h>
-#include <terminal/ecma48_iter.h>
+#include <terminal/ecma48_wrapper.h>
 #include "rl_commands.h"
 #include "editor_module.h"
 #include "pager.h"
+#include "ellipsify.h"
 
 extern "C" {
 #include <compat/config.h>
@@ -31,9 +33,51 @@ extern int __complete_get_screenwidth(void);
 extern pager* g_pager;
 extern editor_module::result* g_result;
 extern setting_bool g_terminal_raw_esc;
-extern int ellipsify(const char* in, int limit, str_base& out, bool expand_ctrl);
 extern int read_key_direct(bool wait);
 extern int clink_is_signaled();
+
+//------------------------------------------------------------------------------
+static linear_allocator s_macro_name_store(4096);
+static str_unordered_map<str_moveable> s_macro_descriptions;
+
+//------------------------------------------------------------------------------
+void clear_macro_descriptions()
+{
+    s_macro_descriptions.clear();
+    s_macro_name_store.reset();
+}
+
+//------------------------------------------------------------------------------
+void add_macro_description(const char* macro, const char* desc)
+{
+    dbg_ignore_scope(snapshot, "macro descriptions");
+
+    const auto iter = s_macro_descriptions.find(macro);
+    if (iter == s_macro_descriptions.end())
+    {
+        macro = s_macro_name_store.store(macro);
+        if (!macro)
+            return;
+    }
+    else
+    {
+        macro = iter->first;
+    }
+
+    s_macro_descriptions.emplace(macro, desc);
+}
+
+//------------------------------------------------------------------------------
+const char* lookup_macro_description(const char* macro)
+{
+    str<> tmp;
+    tmp << "\"" << macro << "\"";
+
+    const auto iter = s_macro_descriptions.find(tmp.c_str());
+    if (iter == s_macro_descriptions.end())
+        return nullptr;
+    return iter->second.c_str();
+}
 
 //------------------------------------------------------------------------------
 struct Keyentry
@@ -617,7 +661,10 @@ static Keyentry* collect_keymap(
             Keyentry& out = collector[*offset];
             out.sort = sort;
             if (entry.type == ISMACR)
+            {
                 out.macro_text = _rl_untranslate_macro_value((char *)entry.function, 0);
+                desc = lookup_macro_description(out.macro_text);
+            }
             else
                 out.macro_text = nullptr;
             out.warning = false;
@@ -740,6 +787,25 @@ static Keyentry* collect_functions(
         ++(*offset);
     }
 
+    for (auto& macro_desc : s_macro_descriptions)
+    {
+        if (*offset >= *max)
+        {
+            *max *= 2;
+            collector = (Keyentry *)realloc(collector, sizeof(collector[0]) * *max);
+        }
+
+        Keyentry& out = collector[*offset];
+        memset(&out, 0, sizeof(out));
+        out.sort = MAKELONG(999, 999);
+        out.key_name = (char*)calloc(1, 1);
+        out.func_name = macro_desc.first;
+        out.func_desc = macro_desc.second.c_str();
+        out.cat = categories ? keycat_macros : 0;
+
+        ++(*offset);
+    }
+
     return collector;
 }
 
@@ -805,19 +871,8 @@ static void pad_with_spaces(str_base& str, unsigned int pad_to)
 }
 
 //------------------------------------------------------------------------------
-static void append_key_macro(str_base& s, const char* macro)
+static void append_key_macro(str_base& s, const char* macro, const int limit)
 {
-#ifdef USE_ASCII_ELLIPSIS
-    static const char ellipsis[] = "...";
-    const int ellipsis_len = 3;
-    const int ellipsis_cells = 3;
-#else
-    static const char ellipsis[] = "\xe2\x80\xa6";
-    const int ellipsis_len = 3;
-    const int ellipsis_cells = 1;
-#endif
-
-    const int limit = 30;
     const int limit_ellipsis = limit - ellipsis_cells;
     int truncate_len = 0;
     unsigned int count = 0;
@@ -849,6 +904,10 @@ static bool is_keyentry_equivalent(const Keyentry* map, int a, int b)
 {
     const Keyentry& ka = map[a];
     const Keyentry& kb = map[b];
+    // Empty names are not equivalent (necessary to report unbound commands).
+    if ((!ka.key_name || !*ka.key_name) || (!kb.key_name || !*kb.key_name))
+        return false;
+    // Different names are not equivalent.
     if (!ka.key_name != !kb.key_name || strcmp(ka.key_name, kb.key_name) != 0)
         return false;
     assert(ka.sort == kb.sort);
@@ -896,6 +955,7 @@ void show_key_bindings(bool friendly, int mode, std::vector<key_binding_info>* o
     qsort(collector + 1, offset - 1, sizeof(*collector), out ? cmp_sort_collector : cmp_sort_collector_cat);
 
     // Remove duplicates; these can happen due to ANYOTHERKEY.
+// TODO: But don't remove unbound entries!
     {
         Keyentry* tortoise = collector + 1;
         Keyentry* hare = collector + 1;
@@ -923,6 +983,7 @@ void show_key_bindings(bool friendly, int mode, std::vector<key_binding_info>* o
     unsigned int longest_key[keycat_MAX] = {};
     unsigned int longest_func[keycat_MAX] = {};
     unsigned int desc_pad = show_descriptions ? 1 : 0;
+    const int macro_limit = _rl_screenwidth * 4 / 10;
     for (int i = 1; i < offset; ++i)
     {
         const Keyentry& entry = collector[i];
@@ -932,7 +993,7 @@ void show_key_bindings(bool friendly, int mode, std::vector<key_binding_info>* o
         if (entry.func_name)
             f = (unsigned int)strlen(entry.func_name);
         else if (entry.macro_text)
-            f = min(2 + (int)strlen(entry.macro_text), 32);
+            f = 2 + min<int>(strlen(entry.macro_text), macro_limit);
         f += desc_pad;
         if (cat)
         {
@@ -1109,7 +1170,7 @@ void show_key_bindings(bool friendly, int mode, std::vector<key_binding_info>* o
                 if (entry.macro_text)
                 {
                     str << "\"";
-                    append_key_macro(str, entry.macro_text);
+                    append_key_macro(str, entry.macro_text, macro_limit);
                     str << "\"";
                 }
                 const int len_name_binding = longest(cat);
@@ -1292,15 +1353,20 @@ int clink_what_is(int, int)
             else
             {
                 char* macro = _rl_untranslate_macro_value((char*)func, 0);
+                const char* desc = lookup_macro_description(macro);
                 if (macro)
                     s << "\"" << macro << "\"";
                 else
                     s << "unknown macro";
+                if (desc)
+                    s << " -- " << desc;
                 free(macro);
             }
-            s << "\n";
 
-            g_printer->print(s.c_str(), s.length());
+            str<> tmp;
+            ecma48_wrapper wrapper(s.c_str(), _rl_screenwidth - 2);
+            while (wrapper.next(tmp))
+                g_printer->print(tmp.c_str(), tmp.length());
         }
     }
 

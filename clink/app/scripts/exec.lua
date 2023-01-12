@@ -46,31 +46,17 @@ local function get_environment_paths()
 end
 
 --------------------------------------------------------------------------------
-local function exec_find_dirs(pattern, case_map)
-    local ret = {}
-
-    for _, dir in ipairs(clink.find_dirs(pattern, case_map)) do
-        if dir ~= "." and dir ~= ".." then
-            table.insert(ret, dir)
-        end
-    end
-
-    return ret
-end
-
---------------------------------------------------------------------------------
 local exec_generator = clink.generator(50)
 
-function exec_generator:generate(line_state, match_builder)
-    -- If executable matching is disabled do nothing
+local function exec_matches(line_state, match_builder, chained)
+    -- If executable matching is disabled do nothing.
     if not settings.get("exec.enable") then
         return false
     end
 
-    -- We're only interested in exec completion if this is the first word of
-    -- the line.
+    -- Special cases for "~", ".", and "..".
     local endword = line_state:getendword()
-    if line_state:getwordcount() > 1 or endword == "~" then
+    if endword == "~" then
         return false
     elseif endword == "." or endword == ".." then
         -- This is to mimic how bash seems to work when completing `.` or `..`
@@ -82,11 +68,20 @@ function exec_generator:generate(line_state, match_builder)
 
     -- If enabled, lines prefixed with whitespace disable executable matching.
     if settings.get("exec.space_prefix") then
-        local word_info = line_state:getwordinfo(1)
-        local offset = line_state:getcommandoffset()
-        if word_info.quoted then offset = offset + 1 end
-        if word_info.offset > offset then
-            return false
+        if chained then
+            local info = line_state:getwordinfo(line_state:getwordcount())
+            if info then
+                local offset = info.offset - (info.quoted and 2 or 1)
+                local prefix = line_state:getline():sub(offset - 1, offset)
+                if prefix:match("[ \t][ \t]") then
+                    return false
+                end
+            end
+        else
+            local offset = line_state:getcommandoffset()
+            if line_state:getline():sub(offset, offset):find("[ \t]") then
+                return false
+            end
         end
     end
 
@@ -95,11 +90,11 @@ function exec_generator:generate(line_state, match_builder)
     local match_cwd = settings.get("exec.cwd")
 
     local paths = nil
-    local text, expanded = rl.expandtilde(line_state:getword(1))
+    local text, expanded = rl.expandtilde(endword)
     local text_dir = (path.getdirectory(text) or ""):gsub("/", "\\")
     if #text_dir == 0 then
         -- Add console aliases as matches.
-        if settings.get("exec.aliases") then
+        if not chained and settings.get("exec.aliases") then
             local aliases = os.getaliases()
             match_builder:addmatches(aliases, "alias")
         end
@@ -119,21 +114,27 @@ function exec_generator:generate(line_state, match_builder)
         paths = {}
     end
 
+    local _, ismain = coroutine.running()
+
     local add_files = function(pattern, rooted)
         local any_added = false
-        local root = nil
-        if rooted then
-            root = (path.getdirectory(pattern) or ""):gsub("/", "\\")
-            if expanded then
-                root = rl.collapsetilde(root)
+        if ismain or os.getdrivetype(pattern) ~= "remote" then
+            local root = nil
+            if rooted then
+                root = (path.getdirectory(pattern) or ""):gsub("/", "\\")
+                if expanded then
+                    root = rl.collapsetilde(root)
+                end
             end
-        end
-        for _, f in ipairs(os.globfiles(pattern, true)) do
-            local file = (root and path.join(root, f.name)) or f.name
-            any_added = match_builder:addmatch({ match = file, type = f.type }) or any_added
+            for _, f in ipairs(os.globfiles(pattern, true)) do
+                local file = (root and path.join(root, f.name)) or f.name
+                any_added = match_builder:addmatch({ match = file, type = f.type }) or any_added
+            end
         end
         return any_added
     end
+
+    local added = false
 
     -- Include files.
     if settings.get("exec.files") then
@@ -142,7 +143,6 @@ function exec_generator:generate(line_state, match_builder)
     end
 
     -- Search 'paths' for files ending in 'suffices' and look for matches.
-    local added = false
     local suffices = (os.getenv("pathext") or ""):explode(";")
     for _, suffix in ipairs(suffices) do
         for _, dir in ipairs(paths) do
@@ -170,3 +170,12 @@ function exec_generator:generate(line_state, match_builder)
 
     return true
 end
+
+function exec_generator:generate(line_state, match_builder) -- luacheck: no self
+    if line_state:getwordcount() <= 1 then
+        return exec_matches(line_state, match_builder)
+    end
+end
+
+-- So that argmatcher :chaincommand() can use exec completion.
+clink._exec_matches = exec_matches

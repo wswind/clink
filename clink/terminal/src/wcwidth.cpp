@@ -62,6 +62,8 @@
 #include <pch.h>
 #include <wchar.h>
 
+extern bool g_color_emoji;
+
 #if defined(__cplusplus)
 extern "C" {
 #endif
@@ -93,6 +95,7 @@ static int bisearch(char32_t ucs, const struct interval *table, int max) {
   return 0;
 }
 
+#include "emoji-test.i"
 
 static const struct interval combining[] = {
   { 0x0300, 0x036F }, { 0x0483, 0x0486 }, { 0x0488, 0x0489 },
@@ -194,6 +197,10 @@ int mk_wcwidth(char32_t ucs)
 
   /* if we arrive here, ucs is not a combining or C0/C1 control character */
 
+  if (g_color_emoji &&
+      bisearch(ucs, emojis, sizeof(emojis) / sizeof(struct interval) - 1))
+    return 2;
+
   return 1 + 
     (ucs >= 0x1100 &&
      (ucs <= 0x115f ||                    /* Hangul Jamo init. consonants */
@@ -293,7 +300,7 @@ static const struct interval ambiguous[] = {
  */
 int mk_wcwidth_cjk(char32_t ucs)
 {
-  /* binary search in table of non-spacing characters */
+  /* binary search in table of ambiguous width chars in CJK codepages */
   if (bisearch(ucs, ambiguous,
 	       sizeof(ambiguous) / sizeof(struct interval) - 1))
     return resolve_ambiguous_wcwidth(ucs);
@@ -446,7 +453,7 @@ void reset_wcwidths()
   s_resolve = g_terminal_east_asian_ambiguous.get();
   if (s_resolve == EAA_auto)
   {
-    static UINT s_cp = 0;
+    static UINT s_cp = 0; // Static so that it's visible in heap dumps.
     s_cp = GetConsoleOutputCP();
     switch (s_cp)
     {
@@ -473,6 +480,30 @@ void reset_wcwidths()
     wcwidth = mk_wcwidth;
     wcswidth = mk_wcswidth;
   }
+}
+
+int test_ambiguous_width_char(char32_t ucs)
+{
+    UINT cp = GetConsoleOutputCP();
+    switch (cp)
+    {
+    case 932:
+    case 936:
+    case 949:
+    case 950:
+        if (bisearch(ucs, ambiguous,
+            sizeof(ambiguous) / sizeof(struct interval) - 1))
+            return 1; // CJK ambiguous width char.
+    }
+
+    if (bisearch(ucs, emojis, sizeof(emojis) / sizeof(struct interval) - 1))
+        return 2; // Color emoji ambiguous width char.
+
+    if (bisearch(ucs, ambiguous_emojis,
+        sizeof(ambiguous_emojis) / sizeof(struct interval) - 1))
+        return 3; // Emoji whose width depends on surrounding characters.
+
+    return 0; // Char width is not known to be ambiguous (but still could be).
 }
 
 #if defined(__cplusplus)

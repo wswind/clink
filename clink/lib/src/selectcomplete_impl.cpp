@@ -12,6 +12,7 @@
 #include "matches_lookaside.h"
 #include "display_matches.h"
 #include "column_widths.h"
+#include "ellipsify.h"
 #include "match_adapter.h"
 
 #include <core/base.h>
@@ -67,11 +68,12 @@ static setting_int g_max_rows(
     "is 0, the limit is the terminal height.",
     0);
 
-static setting_color g_color_comment_row(
+setting_color g_color_comment_row(
     "color.comment_row",
     "Color for comment row",
-    "The color for the comment row during 'clink-select-complete'.  The comment row\n"
-    "shows the \"and N more matches\" or \"rows X to Y of Z\" messages.",
+    "The color for the comment row.  During 'clink-select-complete' the comment\n"
+    "row shows the \"and N more matches\" or \"rows X to Y of Z\" messages.  It\n"
+    "can also show how history expansion will be applied at the cursor.",
     "bright white on cyan");
 
 setting_bool g_match_best_fit(
@@ -88,6 +90,8 @@ setting_int g_match_limit_fitted(
     "when the number of matches exceeds this value.  The default is 0 (unlimited).\n"
     "Depending on the screen width and CPU speed, setting a limit may avoid delays.",
     0);
+
+extern setting_bool g_match_expand_abbrev;
 
 
 
@@ -920,7 +924,7 @@ void selectcomplete_impl::on_matches_changed(const context& context, const line_
     // matches were initially expanded with "g" matching ".git" and "getopt\"
     // but only an explicit wildcard (e.g. "*g") should accept ".git".
     m_needle = needle;
-    update_len();
+    update_len(m_needle.length());
 }
 
 //------------------------------------------------------------------------------
@@ -977,6 +981,8 @@ void selectcomplete_impl::cancel(editor_module::result& result, bool can_reactiv
     reset_generate_matches();
 
     update_display();
+
+    m_matches.reset();
 }
 
 //------------------------------------------------------------------------------
@@ -989,6 +995,7 @@ void selectcomplete_impl::update_matches(bool restrict)
     if (restrict)
     {
         __set_completion_defaults('%');
+        rl_completion_type = '!';
 
         int found_quote = 0;
         int quote_char = 0;
@@ -1007,6 +1014,73 @@ void selectcomplete_impl::update_matches(bool restrict)
     // Update matches.
     ::update_matches();
 
+    // Expand an abbreviated path.
+    str_moveable tmp;
+    override_match_line_state omls;
+    const char* needle = m_needle.c_str();
+    if (g_match_expand_abbrev.get() && !m_matches.get_match_count())
+    {
+        tmp.concat(m_buffer->get_buffer() + m_anchor, m_point - m_anchor);
+
+        // bool just_tilde = false;
+        if (rl_complete_with_tilde_expansion && tmp.c_str()[0] == '~')
+        {
+            // just_tilde = !tmp.c_str()[1];
+            // if (!path::tilde_expand(tmp))
+            //     just_tilde = false;
+            path::tilde_expand(tmp);
+        }
+
+        const char* in = tmp.c_str();
+        str_moveable expanded;
+        const bool disambiguated = os::disambiguate_abbreviated_path(in, expanded);
+        if (expanded.length())
+        {
+#ifdef DEBUG
+            if (dbg_get_env_int("DEBUG_EXPANDABBREV"))
+                printf("\x1b[s\x1b[H\x1b[97;48;5;22mEXPANDED:  \"%s\" + \"%s\" (%s)\x1b[m\x1b[K\x1b[u", expanded.c_str(), in, disambiguated ? "UNIQUE" : "ambiguous");
+#endif
+            if (!disambiguated)
+            {
+stop:
+                m_buffer->begin_undo_group();
+                m_buffer->remove(m_anchor, m_anchor + in - tmp.c_str());
+                m_buffer->set_cursor(m_anchor);
+                m_buffer->insert(expanded.c_str());
+                m_buffer->end_undo_group();
+                // Force the menu-complete family of commands to regenerate
+                // matches, otherwise they'll have no matches.
+                override_rl_last_func(nullptr, true/*force_when_null*/);
+                // Since there are no matches, selectcomplete will be canceled
+                // after returning.
+                return;
+            }
+            else
+            {
+                expanded.concat(in);
+                assert(in + strlen(in) == tmp.c_str() + tmp.length());
+                in = tmp.c_str() + tmp.length();
+                if (path::is_separator(expanded[expanded.length() - 1]))
+                    goto stop;
+                tmp = std::move(expanded);
+                // Override the input editor's line state info to generate
+                // matches using the expanded path, without actually modifying
+                // the Readline line buffer (since we're inside a Readline
+                // callback and Readline isn't prepared for the buffer to
+                // change out from under it).
+                needle = tmp.c_str();
+                const char qc = need_leading_quote(tmp.c_str(), true);
+                omls.override(m_anchor, m_anchor + m_needle.length(), needle, qc);
+                // Perform completion again after the expansion.
+                ::update_matches();
+            }
+        }
+    }
+
+#define m_needle __use_needle_instead__
+
+    // Restrict matches.
+    bool filtered = false;
     if (restrict)
     {
         // Update Readline modes based on the available completions.
@@ -1021,61 +1095,106 @@ void selectcomplete_impl::update_matches(bool restrict)
         m_matches.init_has_descriptions();
     }
 
-    // Perform match display filtering.
+    // Perform match display filtering (match_display_filter or the
+    // ondisplaymatches event).
     const display_filter_flags flags = display_filter_flags::selectable;
-    bool filtered = false;
-    if (m_matches.get_matches()->match_display_filter(nullptr, nullptr, nullptr, flags))
+    if (matches* regen = maybe_regenerate_matches(needle, flags))
     {
-        if (matches* regen = maybe_regenerate_matches(m_needle.c_str(), flags))
+        m_matches.set_regen_matches(regen);
+
+        // Build char** array for filtering.
+        std::vector<autoptr<char>> matches;
+        const unsigned int count = m_matches.get_match_count();
+        matches.emplace_back(nullptr); // Placeholder for lcd.
+        for (unsigned int i = 0; i < count; i++)
         {
-            m_matches.set_regen_matches(regen);
+            const char* text = m_matches.get_match(i);
+            const char* disp = m_matches.get_match_display_raw(i);
+            const char* desc = m_matches.get_match_description(i);
+            const size_t packed_size = calc_packed_size(text, disp, desc);
+            char* buffer = static_cast<char*>(malloc(packed_size));
+            if (pack_match(buffer, packed_size, text, m_matches.get_match_type(i), disp, desc, m_matches.get_match_append_char(i), m_matches.get_match_flags(i), nullptr, false))
+                matches.emplace_back(buffer);
+            else
+                free(buffer);
+        }
+        matches.emplace_back(nullptr);
 
-            // Build char** array for filtering.
-            std::vector<autoptr<char>> matches;
-            const unsigned int count = m_matches.get_match_count();
-            matches.emplace_back(nullptr); // Placeholder for lcd.
-            for (unsigned int i = 0; i < count; i++)
-            {
-                const char* text = m_matches.get_match(i);
-                const size_t len = strlen(text);
-                char* match = static_cast<char*>(malloc(len + 1));
-                memcpy(match, text, len + 1);
-                matches.emplace_back(match);
-            }
-            matches.emplace_back(nullptr);
+        // Get filtered matches.
+        match_display_filter_entry** filtered_matches = nullptr;
+        create_matches_lookaside(&*matches.begin());
+        m_matches.get_matches()->match_display_filter(needle, &*matches.begin(), &filtered_matches, flags);
+        destroy_matches_lookaside(&*matches.begin());
 
-            // Get filtered matches.
-            match_display_filter_entry** filtered_matches = nullptr;
-            create_matches_lookaside(&*matches.begin());
-            m_matches.get_matches()->match_display_filter(m_needle.c_str(), &*matches.begin(), &filtered_matches, flags);
-            destroy_matches_lookaside(&*matches.begin());
-
-            // Use filtered matches.
-            m_matches.set_filtered_matches(filtered_matches);
-            filtered = true;
+        // Use filtered matches.
+        m_matches.set_filtered_matches(filtered_matches);
+        filtered = true;
 
 #ifdef DEBUG
-            if (dbg_get_env_int("DEBUG_FILTER"))
+        if (dbg_get_env_int("DEBUG_FILTER"))
+        {
+            puts("-- SELECTCOMPLETE MATCH_DISPLAY_FILTER");
+            if (filtered_matches && filtered_matches[0])
             {
-                puts("-- SELECTCOMPLETE MATCH_DISPLAY_FILTER");
-                if (filtered_matches && filtered_matches[0])
+                // Skip [0]; Readline expects matches start at [1].
+                str<> tmp;
+                while (*(++filtered_matches))
                 {
-                    // Skip [0]; Readline's expects matches start at [1].
-                    str<> tmp;
-                    while (*(++filtered_matches))
-                    {
-                        match_type_to_string(static_cast<match_type>(filtered_matches[0]->type), tmp);
-                        printf("type '%s', match '%s', display '%s'\n",
-                                tmp.c_str(),
-                                filtered_matches[0]->match,
-                                filtered_matches[0]->display);
-                    }
+                    match_type_to_string(static_cast<match_type>(filtered_matches[0]->type), tmp);
+                    printf("type '%s', match '%s', display '%s'\n",
+                            tmp.c_str(),
+                            filtered_matches[0]->match,
+                            filtered_matches[0]->display);
                 }
-                puts("-- DONE");
             }
-#endif
+            puts("-- DONE");
         }
+#endif
     }
+
+    // Perform match filtering (the onfiltermatches event).
+    if (m_matches.get_match_count() &&
+        m_matches.get_matches()->filter_matches(nullptr, rl_completion_type, rl_filename_completion_desired))
+    {
+        // Build char** array for filtering.
+        const unsigned int count = m_matches.get_match_count();
+        char** matches = (char**)malloc((count + 2) * sizeof(char*));
+        matches[0] = _rl_savestring(""); // Placeholder for lcd; required so that _rl_free_match_list frees the real matches.
+        unsigned int num = 0;
+        for (unsigned int i = 0; i < count; ++i)
+        {
+            const char* text = m_matches.get_match(i);
+            const char* disp = m_matches.get_match_display_raw(i);
+            const char* desc = m_matches.get_match_description(i);
+            const size_t packed_size = calc_packed_size(text, disp, desc);
+            char* buffer = static_cast<char*>(malloc(packed_size));
+            if (pack_match(buffer, packed_size, text, m_matches.get_match_type(i), disp, desc, m_matches.get_match_append_char(i), m_matches.get_match_flags(i), nullptr, false))
+                matches[++num] = buffer;
+            else
+                free(buffer);
+        }
+        matches[num + 1] = nullptr;
+
+        // Get filtered matches.
+        create_matches_lookaside(matches);
+        m_matches.get_matches()->filter_matches(matches, rl_completion_type, rl_filename_completion_desired);
+
+        // Use filtered matches.
+        m_matches.set_alt_matches(matches, true);
+        filtered = true;
+
+#ifdef DEBUG
+        if (dbg_get_env_int("DEBUG_FILTER"))
+        {
+            puts("-- SELECTCOMPLETE FILTER_MATCHES");
+            for (unsigned int i = 1; i <= num; ++i)
+                printf("match '%s'\n", matches[i]);
+            puts("-- DONE");
+        }
+#endif
+    }
+
+#undef m_needle
 
     // Determine the lcd.
     if (restrict)
@@ -1119,15 +1238,15 @@ void selectcomplete_impl::update_matches(bool restrict)
 }
 
 //------------------------------------------------------------------------------
-void selectcomplete_impl::update_len()
+void selectcomplete_impl::update_len(unsigned int needle_len)
 {
     m_len = 0;
 
     if (m_index < m_matches.get_match_count())
     {
         size_t len = strlen(m_matches.get_match(m_index));
-        if (len > m_needle.length())
-            m_len = len - m_needle.length();
+        if (len > needle_len)
+            m_len = len - needle_len;
     }
 }
 
@@ -1163,6 +1282,7 @@ force_desc_below:
         const int limit_fit = g_match_limit_fitted.get();
         const bool desc_inline = !m_desc_below && m_matches.has_descriptions();
         const bool one_column = desc_inline && m_matches.get_match_count() <= DESC_ONE_COLUMN_THRESHOLD;
+        rollback<int> rcpdl(_rl_completion_prefix_display_length, 0);
         m_widths = calculate_columns(&m_matches, best_fit ? limit_fit : -1, one_column, m_desc_below, col_extra);
         m_calc_widths = false;
     }
@@ -1538,7 +1658,7 @@ void selectcomplete_impl::update_display()
             m_printer->print(s.c_str(), s.length());
         }
         GetConsoleScreenBufferInfo(h, &csbi);
-        m_mouse_offset = csbi.dwCursorPosition.Y - csbi.srWindow.Top + 1/*to top item*/;
+        m_mouse_offset = csbi.dwCursorPosition.Y + 1/*to top item*/;
         _rl_move_vert(vpos);
         _rl_last_c_pos = cpos;
         GetConsoleScreenBufferInfo(h, &csbi);
@@ -1644,6 +1764,7 @@ void selectcomplete_impl::insert_match(int final)
         }
     }
 
+    unsigned int needle_len = 0;
     if (final)
     {
         int nontrivial_lcd = __compare_match(const_cast<char*>(m_needle.c_str()), match);
@@ -1717,13 +1838,20 @@ void selectcomplete_impl::insert_match(int final)
     else
     {
         m_buffer->insert(qs);
-        m_point = m_anchor + strlen(qs) + m_needle.length();
+        m_point = m_anchor + strlen(qs);
+        str_iter lhs(m_needle);
+        str_iter rhs(m_buffer->get_buffer() + m_point, m_buffer->get_length() - m_point);
+        const int cmp_len = str_compare(lhs, rhs);
+        if (cmp_len == m_needle.length())
+            needle_len = cmp_len;
     }
+
+    m_point += needle_len;
 
     m_buffer->set_cursor(m_point);
     m_buffer->end_undo_group();
 
-    update_len();
+    update_len(needle_len);
     m_inserted = true;
 
     const int botlin = _rl_vis_botlin;

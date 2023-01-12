@@ -1,15 +1,15 @@
 -- Copyright (c) 2021 Christopher Antos
 -- License: http://opensource.org/licenses/MIT
 
+-- luacheck: max line length 150
+
 --------------------------------------------------------------------------------
 clink = clink or {}
 local _coroutines = {}
-local _coroutines_created = {}          -- Remembers creation info for each coroutine, for use by clink.addcoroutine.
 local _after_coroutines = {}            -- Funcs to run after a pass resuming coroutines.
 local _coroutines_resumable = false     -- When false, coroutines will no longer run.
 local _coroutine_yieldguard = {}        -- Which coroutine is yielding inside popenyield, for a given category of coroutines.
 local _coroutine_context = nil          -- Context for queuing io.popenyield calls from a same source.
-local _coroutine_canceled = false       -- Becomes true if an orphaned io.popenyield cancels the coroutine.
 local _coroutine_generation = 0         -- ID for current generation of coroutines.
 
 local _dead = nil                       -- List of dead coroutines (only when "lua.debug" is set, or in DEBUG builds).
@@ -42,8 +42,8 @@ local print = clink.print
 --      firstclock:     The os.clock() from the beginning of the first resume.
 --      throttleclock:  The os.clock() from the end of the most recent yieldguard.
 --      lastclock:      The os.clock() from the end of the last resume.
---      infinite:       Use INFINITE wait for this coroutine; it's actively inside popenyield.
 --      queued:         Use INFINITE wait for this coroutine; it's queued inside popenyield.
+--      yieldguard:     Yielding due to io.popen, os.execute, etc.
 
 --------------------------------------------------------------------------------
 local function clear_coroutines()
@@ -61,12 +61,10 @@ local function clear_coroutines()
     end
 
     _coroutines = {}
-    _coroutines_created = {}
     _after_coroutines = {}
     _coroutines_resumable = false
     -- Don't touch _coroutine_yieldguard; it only gets cleared when the thread finishes.
     _coroutine_context = nil
-    _coroutine_canceled = false
     _coroutine_generation = _coroutine_generation + 1
 
     _dead = (settings.get("lua.debug") or clink.DEBUG) and {} or nil
@@ -89,9 +87,11 @@ local function release_coroutine_yieldguard()
                 entry.throttleclock = os.clock()
                 entry.yieldguard = nil
                 table.insert(nil_cats, category)
-                for _,entry in pairs(_coroutines) do
-                    if entry.queued then
-                        entry.queued = nil
+                -- TODO: This is an arbitrary order, but the dequeue order
+                -- should ideally be FIFO.
+                for _,e in pairs(_coroutines) do
+                    if e.queued and e.category == category then
+                        e.queued = nil
                         break
                     end
                 end
@@ -104,10 +104,9 @@ local function release_coroutine_yieldguard()
 end
 
 --------------------------------------------------------------------------------
-local function get_coroutine_generation()
-    local t = coroutine.running()
-    if t and _coroutines[t] then
-        return _coroutines[t].generation
+local function get_coroutine_generation(c)
+    if c and _coroutines[c] then
+        return _coroutines[c].generation
     end
 end
 
@@ -123,8 +122,11 @@ local function set_coroutine_yieldguard(yieldguard)
     local t = coroutine.running()
     local entry = _coroutines[t]
     if yieldguard then
+        local cyg = { coroutine=t, yieldguard=yieldguard }
         if entry.yield_category then
-            _coroutine_yieldguard[entry.yield_category] = { coroutine=t, yieldguard=yieldguard }
+            _coroutine_yieldguard[entry.yield_category] = cyg
+        else
+            table.insert(_coroutine_yieldguard, cyg)
         end
     else
         release_coroutine_yieldguard()
@@ -144,14 +146,13 @@ end
 
 --------------------------------------------------------------------------------
 local function cancel_coroutine(message)
-    _coroutine_canceled = true
     clink._cancel_coroutine()
     error((message or "").."canceling popenyield; coroutine is orphaned")
 end
 
 --------------------------------------------------------------------------------
 local function check_generation(c)
-    if get_coroutine_generation() == _coroutine_generation then
+    if get_coroutine_generation(c) == _coroutine_generation then
         return true
     end
     local entry = _coroutines[c]
@@ -206,7 +207,7 @@ function clink._wait_duration()
         release_coroutine_yieldguard()  -- Dequeue next if necessary.
         for _,entry in pairs(_coroutines) do
             local this_target = next_entry_target(entry, now)
-            if entry.yieldguard or entry.queued then
+            if entry.yieldguard or entry.queued then -- luacheck: ignore 542
                 -- Yield until output is ready; don't influence the timeout.
             elseif not target or target > this_target then
                 target = this_target
@@ -221,7 +222,6 @@ end
 --------------------------------------------------------------------------------
 function clink._set_coroutine_context(context)
     _coroutine_context = context
-    _coroutine_canceled = false
 end
 
 --------------------------------------------------------------------------------
@@ -233,10 +233,15 @@ function clink._resume_coroutines()
 
     -- Protected call to resume coroutines.
     local remove = {}
+    local co
     local impl = function()
-        for _,entry in pairs(_coroutines) do
-            if coroutine.status(entry.coroutine) == "dead" then
-                table.insert(remove, _)
+        for c,entry in pairs(_coroutines) do
+            co = c
+            if coroutine.status(c) == "dead" then
+                table.insert(remove, c)
+            elseif not check_generation(c) and not entry.yieldguard then
+                entry.canceled = true
+                table.insert(remove, c)
             else
                 _coroutines_resumable = true
                 local now = os.clock()
@@ -246,23 +251,26 @@ function clink._resume_coroutines()
                     end
                     entry.resumed = entry.resumed + 1
                     clink._set_coroutine_context(entry.context)
-                    local ok, ret = coroutine.resume(entry.coroutine, true--[[async]])
+                    local ok, ret
+                    if entry.isprompt or entry.isgenerator then
+                        ok, ret = coroutine.resume(c, true--[[async]])
+                    else
+                        ok, ret = coroutine.resume(c)
+                    end
                     if ok then
                         -- Use live clock so the interval excludes the execution
                         -- time of the coroutine.
                         entry.lastclock = os.clock()
                     else
-                        if _coroutine_canceled then
-                            entry.canceled = true
-                        else
+                        if not entry.canceled then
                             print("")
                             print("coroutine failed:")
-                            print(ret)
+                            _co_error_handler(c, ret)
                             entry.error = ret
                         end
                     end
-                    if coroutine.status(entry.coroutine) == "dead" then
-                        table.insert(remove, _)
+                    if coroutine.status(c) == "dead" then
+                        table.insert(remove, c)
                     end
                 end
             end
@@ -279,7 +287,7 @@ function clink._resume_coroutines()
     if not ok then
         print("")
         print("coroutine failed:")
-        print(ret)
+        _co_error_handler(co, ret)
         -- Don't return yet!  Need to do cleanup.
     end
 
@@ -369,7 +377,7 @@ end
 --------------------------------------------------------------------------------
 local function table_has_elements(t)
     if t then
-        for _ in pairs(t) do
+        for _ in pairs(t) do -- luacheck: ignore 512
             return true
         end
     end
@@ -412,8 +420,6 @@ function clink._diag_coroutines()
 
     local mixed_gen = false
     local show_gen = false
-    local threads = {}
-    local deadthreads = {}
     local max_resumed_len = 0
     local max_freq_len = 0
 
@@ -454,9 +460,12 @@ function clink._diag_coroutines()
             end
             if t.entry.canceled then
                 status = status..cyan.."canceled"..plain.."  "
+            else -- luacheck: ignore 542
+                -- TODO: Show when throttled.
             end
             local res = "resumed "..str_rpad(t.resumed, max_resumed_len)
             local freq = "freq "..str_rpad(t.freq, max_freq_len)
+            -- TODO: Show next wakeup time.
             local src = tostring(t.entry.src)
             print(plain.."  "..key.."  "..gen..status..res.."  "..freq.."  "..src..norm)
             if t.entry.error then
@@ -464,6 +473,9 @@ function clink._diag_coroutines()
             end
         end
     end
+
+    local threads = {}
+    local deadthreads = {}
 
     collect_diag(_coroutines, threads)
     if _dead then
@@ -605,7 +617,7 @@ function clink.removecoroutine(c)
         end
         _coroutines[c] = nil
         _coroutines_resumable = false
-        for _ in pairs(_coroutines) do
+        for _ in pairs(_coroutines) do -- luacheck: ignore 512
             _coroutines_resumable = true
             break
         end
@@ -699,24 +711,41 @@ end
 --- -ver:   1.2.10
 --- -arg:   command:string
 --- -arg:   [mode:string]
---- -ret:   file
---- This is the same as
---- <code><span class="hljs-built_in">io</span>.<span class="hljs-built_in">popen</span>(<span class="arg">command</span>, <span class="arg">mode</span>)</code>
---- except that it only supports read mode and it yields until the command has
---- finished:
+--- -ret:   file, function (see remarks below)
+--- This behaves similar to
+--- <a href="https://www.lua.org/manual/5.2/manual.html#pdf-io.popen">io.popen()</a>
+--- except that it only supports read mode and when used in a coroutine it
+--- yields until the command has finished.
 ---
---- Runs <span class="arg">command</span> and returns a read file handle for
---- reading output from the command.  It yields until the command has finished
---- and the complete output is ready to be read without blocking.
+--- The <span class="arg">command</span> argument is the command to run.
 ---
---- The <span class="arg">mode</span> can contain "r" (read mode) and/or either
---- "t" for text mode (the default if omitted) or "b" for binary mode.  Write
---- mode is not supported, so it cannot contain "w".
+--- The <span class="arg">mode</span> argument is the optional mode to use.  It
+--- can contain "r" (read mode) and/or either "t" for text mode (the default if
+--- omitted) or "b" for binary mode.  Write mode is not supported, so it cannot
+--- contain "w".
+---
+--- This runs the specified command and returns a read file handle for reading
+--- output from the command.  It yields until the command has finished and the
+--- complete output is ready to be read without blocking.
+---
+--- In v1.3.31 and higher, it may also return a function.  If the second return
+--- value is a function then it can be used to get the exit status for the
+--- command.  The function returns the same values as
+--- <a href="https://www.lua.org/manual/5.2/manual.html#pdf-os.execute">os.execute()</a>.
+--- The function may be used only once, and it closes the read file handle, so
+--- if the function is used then do not use <code>file:close()</code>.  Or, if
+--- the second return value is not a function, then the exit status may be
+--- retrieved from calling <code>file:close()</code> on the returned file handle.
+---
+--- <strong>Compatibility Note:</strong> when <code>io.popen()</code> is used in
+--- a coroutine, it is automatically redirected to <code>io.popenyield()</code>.
+--- This means on success the second return value from <code>io.popen()</code>
+--- in a coroutine may not be nil as callers might normally expect.
 ---
 --- <strong>Note:</strong> if the <code>prompt.async</code> setting is disabled,
 --- or while a <a href="#transientprompts">transient prompt filter</a> is
---- executing, then this behaves like
---- <code><span class="hljs-built_in">io</span>.<span class="hljs-built_in">popen</span>(<span class="arg">command</span>, <span class="arg">mode</span>)</code>
+--- executing, or if used outside of a coroutine, then this behaves like
+--- <code><a href="https://www.lua.org/manual/5.2/manual.html#pdf-io.popen">io.popen()</a></code>
 --- instead.
 --- -show:  local file = io.popenyield("git status")
 --- -show:
@@ -728,6 +757,12 @@ end
 --- -show:  &nbsp;   do_things_with(line)
 --- -show:  end
 --- -show:  file:close()
+--- Here is an example showing how to get the exit status, if desired:
+--- -show:  -- Clink v1.3.31 and higher return a pclose function, for optional use.
+--- -show:  local file, pclose = io.popenyield("kubectl.exe")
+--- -show:  if file then
+--- -show:  &nbsp;   local ok, what, code = pclose()
+--- -show:  end
 function io.popenyield(command, mode)
     -- This outer wrapper is implemented in Lua so that it can yield.
     local c, ismain = coroutine.running()
@@ -774,7 +809,31 @@ function io.popenyield(command, mode)
             end
             set_coroutine_yieldguard(nil)
         end
-        return file
+        -- Make a pclose function.
+        local state = { yg=yieldguard }
+        local pclose = file and yieldguard and function ()
+            -- Only allow to run once.
+            if state.zombie then
+                error("function already used; can only be used once.")
+                return
+            end
+            state.zombie = true
+            -- Close the file.
+            file:close()
+            -- Make ready() wait for process exit.
+            yieldguard:set_need_completion()
+            -- Yield until ready.
+            set_coroutine_yieldguard(yieldguard)
+            while not yieldguard:ready() do
+                coroutine.yield()
+                -- Do not allow canceling.  This enforces no more than one spawned
+                -- background process is running at a time.
+            end
+            set_coroutine_yieldguard(nil)
+            -- Return exit status.
+            return yieldguard:results()
+        end
+        return file, pclose
     else
         return io.popen(command, mode)
     end
@@ -862,7 +921,7 @@ end
 
 --------------------------------------------------------------------------------
 local orig_coroutine_create = coroutine.create
-function coroutine.create(func)
+function coroutine.create(func) -- luacheck: ignore 122
     -- Get src of func.
     local src = override_coroutine_src_func or func
     if src then
@@ -906,7 +965,7 @@ end
 
 --------------------------------------------------------------------------------
 local orig_coroutine_resume = coroutine.resume
-function coroutine.resume(co, ...)
+function coroutine.resume(co, ...) -- luacheck: ignore 122
     local entry = _coroutines[co]
     restore_coroutine_state(entry, co)
 
@@ -914,6 +973,15 @@ function coroutine.resume(co, ...)
     clink.co_state = entry.co_state
 
     local ret = table.pack(orig_coroutine_resume(co, ...))
+
+    if ret and not ret[1] and ret[2] then
+        local err = tostring(ret[2])
+        entry.error = err
+        if settings.get("lua.debug") then
+            local full_err = debug.traceback(co, err)
+            log.info("error in coroutine:  "..full_err)
+        end
+    end
 
     clink.co_state = old_co_state
     save_coroutine_state(entry, co)

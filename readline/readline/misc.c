@@ -94,6 +94,9 @@ _rl_arg_overflow (void)
       _rl_argcxt = 0;
       rl_explicit_arg = rl_numeric_arg = 0;
       rl_ding ();
+/* begin_clink_change */
+      if (!RL_ISSTATE (RL_STATE_CALLBACK))
+/* end_clink_change */
       rl_restore_prompt ();
       rl_clear_message ();
       RL_UNSETSTATE(RL_STATE_NUMERICARG);
@@ -105,6 +108,9 @@ _rl_arg_overflow (void)
 void
 _rl_arg_init (void)
 {
+/* begin_clink_change */
+  if (!RL_ISSTATE (RL_STATE_CALLBACK))
+/* end_clink_change */
   rl_save_prompt ();
   _rl_argcxt = 0;
   RL_SETSTATE(RL_STATE_NUMERICARG);
@@ -150,6 +156,9 @@ _rl_arg_dispatch (_rl_arg_cxt cxt, int c)
       else
 	{
 	  key = _rl_bracketed_read_key ();
+/* begin_clink_change */
+	  if (!RL_ISSTATE (RL_STATE_CALLBACK))
+/* end_clink_change */
 	  rl_restore_prompt ();
 	  rl_clear_message ();
 	  RL_UNSETSTATE(RL_STATE_NUMERICARG);
@@ -179,6 +188,9 @@ _rl_arg_dispatch (_rl_arg_cxt cxt, int c)
       /* Make M-- command equivalent to M--1 command. */
       if ((_rl_argcxt & NUM_SAWMINUS) && rl_numeric_arg == 1 && rl_explicit_arg == 0)
 	rl_explicit_arg = 1;
+/* begin_clink_change */
+      if (!RL_ISSTATE (RL_STATE_CALLBACK))
+/* end_clink_change */
       rl_restore_prompt ();
       rl_clear_message ();
       RL_UNSETSTATE(RL_STATE_NUMERICARG);
@@ -242,6 +254,11 @@ rl_digit_argument (int ignore, int key)
   if (RL_ISSTATE (RL_STATE_CALLBACK))
     {
       _rl_arg_dispatch (_rl_argcxt, key);
+/* begin_clink_change */
+      if (_rl_arg_overflow ())
+        return 0;
+      if (RL_ISSTATE (RL_STATE_NUMERICARG))
+/* end_clink_change */
       rl_message ("(arg: %d) ", rl_arg_sign * rl_numeric_arg);
       return 0;
     }
@@ -276,6 +293,9 @@ _rl_arg_callback (_rl_arg_cxt cxt)
   if (_rl_argcxt & NUM_READONE)
     {
       _rl_argcxt &= ~NUM_READONE;
+/* begin_clink_change */
+      if (!RL_ISSTATE (RL_STATE_CALLBACK))
+/* end_clink_change */
       rl_restore_prompt ();
       rl_clear_message ();
       RL_UNSETSTATE(RL_STATE_NUMERICARG);
@@ -286,6 +306,12 @@ _rl_arg_callback (_rl_arg_cxt cxt)
   r = _rl_arg_dispatch (cxt, c);
   if (r > 0)
     rl_message ("(arg: %d) ", rl_arg_sign * rl_numeric_arg);
+
+/* begin_clink_change */
+  if (_rl_arg_overflow ())
+    return (1);		/* EOF */
+/* end_clink_change */
+
   return (r != 1);
 }
 

@@ -3,6 +3,7 @@
 
 --------------------------------------------------------------------------------
 local any_warnings_or_failures = nil
+local include_arm64 = true
 
 --------------------------------------------------------------------------------
 local release_manifest = {
@@ -10,6 +11,7 @@ local release_manifest = {
     "clink.lua",
     "clink_x*.exe",
     "clink*.dll",
+    "clink*.ico",
     "CHANGES",
     "LICENSE",
     "clink_x*.pdb",
@@ -17,6 +19,10 @@ local release_manifest = {
     "_default_settings",
     "_default_inputrc",
 }
+
+if include_arm64 then
+    table.insert(release_manifest, "clink_arm64.exe")
+end
 
 --------------------------------------------------------------------------------
 local function warn(msg)
@@ -49,6 +55,28 @@ local function exec(cmd, silent)
     path.normalize = prev_norm
 
     return ret == 0
+end
+
+--------------------------------------------------------------------------------
+local function exec_with_retry(cmd, tries, delay, silent)
+    while tries > 0 do
+        if exec(cmd, silent) then
+            return true
+        end
+
+        tries = tries - 1
+
+        if tries > 0 then
+            print("... waiting to retry ...")
+            local target = os.clock() + delay
+            while os.clock() < target do
+                -- Busy wait, but this is such a rare case that it's not worth
+                -- trying to be more efficient.
+            end
+        end
+    end
+
+    return false
 end
 
 --------------------------------------------------------------------------------
@@ -127,11 +155,12 @@ end
 --------------------------------------------------------------------------------
 newaction {
     trigger = "nsis",
-    description = "Clink: Creates a (debug) installer for Clink",
+    description = "Clink: Creates a pre-release installer for Clink (reltype is debug by default)",
     execute = function()
         local premake = _PREMAKE_COMMAND
         local root_dir = path.getabsolute(".build/vs2019/bin").."/"
         local code_dir = path.getabsolute(".").."/"
+        local config = _OPTIONS["config"] or "debug"
 
         exec_lead = ""
 
@@ -148,6 +177,7 @@ newaction {
         -- Build the code.
         local x86_ok = true
         local x64_ok = true
+        local arm64_ok = true
         local toolchain = "ERROR"
         local build_code = function (target)
             target = target or "build"
@@ -155,15 +185,18 @@ newaction {
             toolchain = _OPTIONS["vsver"] or "vs2019"
             os.chdir(".build/" .. toolchain)
 
-            x86_ok = exec(have_msbuild .. " /m /v:q /p:configuration=debug /p:platform=win32 clink.sln /t:" .. target)
-            x64_ok = exec(have_msbuild .. " /m /v:q /p:configuration=debug /p:platform=x64 clink.sln /t:" .. target)
+            x86_ok = exec(have_msbuild .. " /m /v:q /p:configuration=" .. config .. " /p:platform=win32 clink.sln /t:" .. target)
+            x64_ok = exec(have_msbuild .. " /m /v:q /p:configuration=" .. config .. " /p:platform=x64 clink.sln /t:" .. target)
+            if include_arm64 then
+                arm64_ok = exec(have_msbuild .. " /m /v:q /p:configuration=" .. config .. " /p:platform=arm64 clink.sln /t:" .. target)
+            end
 
             os.chdir("../..")
         end
 
         build_code()
 
-        local src = path.getabsolute(".build/" .. toolchain .. "/bin/debug").."/"
+        local src = path.getabsolute(".build/" .. toolchain .. "/bin/" .. config) .. "/"
 
         -- Do a coarse check to make sure there's a build available.
         if not os.isdir(src .. ".") or not (x86_ok or x64_ok) then
@@ -192,6 +225,8 @@ newaction {
             local from = src
             if mask == "CHANGES" or mask == "LICENSE" or mask == "_default_settings" or mask == "_default_inputrc" then
                 from = code_dir
+            elseif mask == "clink*.ico" then
+                from = code_dir.."clink/app/resources/"
             elseif mask:sub(-4) == ".pdb" then
                 from = nil
             end
@@ -215,7 +250,7 @@ newaction {
             nsis_cmd = nsis_cmd .. " " .. code_dir .. "/installer/clink.nsi"
             nsis_ok = exec(nsis_cmd)
             if nsis_ok then
-                rename(dest.."_setup.exe", "clink_setup.exe")
+                rename(dest.."_setup.exe", "clink_setup_" .. config .. ".exe")
             end
         end
 
@@ -224,6 +259,7 @@ newaction {
         if not nsis_ok then     warn("INSTALLER PACKAGE FAILED") end
         if not x86_ok then      failed("x86 BUILD FAILED") end
         if not x64_ok then      failed("x64 BUILD FAILED") end
+        if not arm64_ok then    failed("arm64 BUILD FAILED") end
     end
 }
 
@@ -255,6 +291,7 @@ newaction {
         -- Build the code.
         local x86_ok = true
         local x64_ok = true
+        local arm64_ok = true
         local toolchain = "ERROR"
         local build_code = function (target)
             if have_msbuild then
@@ -266,6 +303,9 @@ newaction {
 
                 x86_ok = exec(have_msbuild .. " /m /v:q /p:configuration=final /p:platform=win32 clink.sln /t:" .. target)
                 x64_ok = exec(have_msbuild .. " /m /v:q /p:configuration=final /p:platform=x64 clink.sln /t:" .. target)
+                if include_arm64 then
+                    arm64_ok = exec(have_msbuild .. " /m /v:q /p:configuration=final /p:platform=arm64 clink.sln /t:" .. target)
+                end
 
                 os.chdir("../..")
             elseif have_mingw then
@@ -277,6 +317,9 @@ newaction {
 
                 x86_ok = exec(have_mingw .. " CC=gcc config=final_x32 -j%number_of_processors% " .. target)
                 x64_ok = exec(have_mingw .. " CC=gcc config=final_x64 -j%number_of_processors% " .. target)
+                if include_arm64 then
+                    arm64_ok = nil
+                end
 
                 os.chdir("../..")
             else
@@ -286,7 +329,7 @@ newaction {
 
         -- Build everything.
         build_code("luac")
-        exec(premake .. " embed")
+        exec(premake .. " " .. (_OPTIONS["dbginfo"] and "embed_debug" or "embed"))
         build_code()
 
         local src = path.getabsolute(".build/" .. toolchain .. "/bin/final").."/"
@@ -337,6 +380,8 @@ newaction {
             local from = src
             if mask == "_default_settings" or mask == "_default_inputrc" then
                 from = code_dir
+            elseif mask:match("clink.*%.ico") then
+                from = code_dir.."clink/app/resources/"
             end
             copy(from .. mask, dest)
         end
@@ -364,7 +409,9 @@ newaction {
         -- Zip up the source code.
         os.chdir("..")
         local src_dir_name = target_dir..clink_suffix.."_src"
-        exec("move ~working " .. src_dir_name)
+        if not exec_with_retry("move ~working " .. src_dir_name, 3, 10.0) then
+            error("Failed to move ~working to " .. src_dir_name)
+        end
 
         if have_7z then
             os.chdir(src_dir_name)
@@ -389,6 +436,13 @@ newaction {
         if not nsis_ok then     warn("INSTALLER PACKAGE FAILED") end
         if not x86_ok then      failed("x86 BUILD FAILED") end
         if not x64_ok then      failed("x64 BUILD FAILED") end
+        if arm64_ok == nil then
+            local x = any_warnings_or_failures
+            warn("arm64 build skipped.")
+            any_warnings_or_failures = x
+        elseif not arm64_ok then
+            failed("arm64 BUILD FAILED")
+        end
         if not any_warnings_or_failures then
             print("\x1b[0;32;1mRelease "..version.." built successfully.\x1b[m")
         end
@@ -414,4 +468,22 @@ newoption {
    trigger     = "commit",
    value       = "SPEC",
    description = "Clink: Git commit/tag to build Clink release from"
+}
+
+--------------------------------------------------------------------------------
+newoption {
+    trigger     = "config",
+    value       = "CONFIG",
+    description = "Clink: The build configuration for 'nsis' command",
+    allowed     = {
+        { "debug",      "For local use; debug mode code, uses local Lua scripts"},
+        { "release",    "For local use; optimized code, uses local Lua scripts" },
+        { "final",      "Can share installer externally; optimized code, Lua scripts are embedded" },
+    }
+}
+
+--------------------------------------------------------------------------------
+newoption {
+    trigger     = "dbginfo",
+    description = "Clink: Include debug info in embedded Lua scripts"
 }

@@ -14,7 +14,7 @@ struct match_display_filter_entry
     unsigned char type;         // Match type.
     char append_char;           // Append character.
     unsigned char flags;        // Match flags.
-    char buffer[1];             // Variable length buffer containing match, display, and description.
+    char buffer[1];             // Variable length buffer containing the PACKED MATCH FORMAT.
 };
 typedef struct match_display_filter_entry match_display_filter_entry;
 
@@ -43,10 +43,6 @@ int append_filename(char* to_print, const char* full_pathname, int prefix_bytes,
 void pad_filename(int len, int pad_to_width, int selected);
 bool get_match_color(const char *f, match_type type, str_base& out);
 
-typedef void (*vstrlen_func_t)(const char* s, int len);
-int ellipsify_to_callback(const char* in, int limit, int expand_ctrl, vstrlen_func_t callback);
-int ellipsify(const char* in, int limit, str_base& out, bool expand_ctrl);
-
 void free_filtered_matches(match_display_filter_entry** filtered_matches);
 int printable_len(const char* match, match_type type);
 
@@ -66,3 +62,20 @@ int printable_len(const char* match, match_type type);
 //  DISPLAY (nul terminated char string)
 //  DESCRIPTION (nul terminated char string)
 extern "C" void display_matches(char **matches);
+
+extern void override_line_state(const char* line, const char* needle, int point);
+#ifdef DEBUG
+extern bool is_line_state_overridden();
+#endif
+
+class override_match_line_state
+{
+public:
+    override_match_line_state() { assert(!is_line_state_overridden()); }
+    ~override_match_line_state() { override_line_state(nullptr, nullptr, 0); }
+    void override(int start, int end, const char* needle, char quote_char=0);
+private:
+    str_moveable m_line;
+};
+
+char need_leading_quote(const char* match, bool force_filename_completion_desired=false);

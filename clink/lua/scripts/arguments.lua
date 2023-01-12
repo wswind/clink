@@ -4,6 +4,8 @@
 ------------------------------------------------------------------------------
 -- NOTE: If you add any settings here update set.cpp to load (lua, lib, arguments).
 
+-- luacheck: no max line length
+
 --------------------------------------------------------------------------------
 local _arglink = {}
 _arglink.__index = _arglink
@@ -20,8 +22,6 @@ end
 
 
 --------------------------------------------------------------------------------
-local _argmatcher_fromhistory = {}
-local _argmatcher_fromhistory_root
 local _delayinit_generation = 0
 local _clear_onuse_coroutine = {}
 local _clear_delayinit_coroutine = {}
@@ -69,9 +69,14 @@ end
 --------------------------------------------------------------------------------
 --[[
 local enable_tracing = true
+local debug_print = true
 function _argreader:trace(...)
     if self._tracing then
-        print(...)
+        if debug_print then
+            os.debugprint(...)
+        else
+            print(...)
+        end
     end
 end
 function _argreader:starttracing(word)
@@ -88,7 +93,7 @@ end
 local function do_delayed_init(list, matcher, arg_index)
     -- Don't init while generating matches from history, as that could be
     -- excessively expensive (could run thousands of callbacks).
-    if _argmatcher_fromhistory and _argmatcher_fromhistory.argmatcher then
+    if clink.co_state._argmatcher_fromhistory and clink.co_state._argmatcher_fromhistory.argmatcher then
         return
     end
 
@@ -121,16 +126,26 @@ local function do_delayed_init(list, matcher, arg_index)
             local addees = list.delayinit(matcher, arg_index)
             matcher:_add(list, addees)
             -- Mark the init callback as finished.
-            matcher._init_coroutine[arg_index] = nil
-            _clear_delayinit_coroutine[matcher][arg_index] = nil
+            local mic = matcher._init_coroutine
+            if mic then -- Avoid error if argmatcher was reset in the meantime.
+                mic[arg_index] = nil
+            end
+            local cdc = _clear_delayinit_coroutine[matcher]
+            if cdc then -- It may have been cleared by a new edit session.
+                cdc[arg_index] = nil
+            end
             list.delayinit = nil
             -- If originally started from not-main, then reclassify.
             if async_delayinit then
-                clink._invalidate_matches()
+                clink._signal_delayed_init()
                 clink.reclassifyline()
             end
         end)
         matcher._init_coroutine[arg_index] = c
+
+        -- Make sure the delayinit coroutine runs to completion, even if a new
+        -- prompt generation begins (which would normally orphan coroutines).
+        clink.runcoroutineuntilcomplete(c)
 
         -- Set up to be able to efficiently clear dangling coroutine references,
         -- e.g. in case a coroutine doesn't finish before a new edit line.
@@ -147,7 +162,12 @@ local function do_delayed_init(list, matcher, arg_index)
     else
         -- Run the coroutine up to the first yield, so that if it doesn't need
         -- to yield at all then it completes right now.
-        coroutine.resume(c)
+        local ok, ret = coroutine.resume(c)
+        if not ok and ret and settings.get("lua.debug") then
+            print("")
+            print("coroutine failed:")
+            _co_error_handler(c, ret)
+        end
     end
 end
 
@@ -215,7 +235,9 @@ end
 --
 -- On return, the _argreader should be primed for generating matches for the
 -- NEXT word in the line.
-function _argreader:update(word, word_index)
+--
+-- Returns TRUE when chaining due to chaincommand().
+function _argreader:update(word, word_index, skip_last) -- luacheck: no unused
     local arg_match_type = "a" --arg
     local line_state = self._line_state
 
@@ -266,11 +288,13 @@ function _argreader:update(word, word_index)
     if is_flag then
         if matcher._flags then
             local arg = matcher._flags._args[1]
-            if arg and arg.delayinit then
-                do_delayed_init(arg, matcher, 0)
-            end
-            if arg and arg.onarg and clink._in_generate() then
-                arg.onarg(0, word, word_index, line_state, self._user_data)
+            if arg then
+                if arg.delayinit then
+                    do_delayed_init(arg, matcher, 0)
+                end
+                if arg.onarg and clink._in_generate() then
+                    arg.onarg(0, word, word_index, line_state, self._user_data)
+                end
             end
             if word == matcher._endofflags then
                 self._noflags = true
@@ -295,6 +319,32 @@ function _argreader:update(word, word_index)
     local arg_index = self._arg_index
     local arg = matcher._args[arg_index]
     local next_arg_index = arg_index + 1
+
+    -- If the arg has looping characters defined and a looping character
+    -- separates this word from the next, then don't advance to the next
+    -- argument index.
+    if arg and arg.loopchars and word_index < line_state:getwordcount() then
+        local thiswordinfo = line_state:getwordinfo(word_index)
+        local nextwordinfo = line_state:getwordinfo(word_index + 1)
+        local s = thiswordinfo.offset + thiswordinfo.length + (thiswordinfo.quoted and 1 or 0)
+        local e = nextwordinfo.offset - 1 - (nextwordinfo.quoted and 1 or 0)
+        if s == e then
+            -- Two words are separated by a looping character, and the
+            -- looping char is a natural word break char (e.g. semicolon).
+            local line = line_state:getline()
+            if line and arg.loopchars:find(line:sub(s, e, 1, true)) then
+                next_arg_index = arg_index
+            end
+        elseif s - 1 == e then
+            local line = line_state:getline()
+            if line and arg.loopchars:find(line:sub(e, e, 1, true)) then
+                -- End word is immediately preceded by a looping character.
+                -- This is reached when getwordbreakinfo() splits a word due to
+                -- a looping char that is not a natural word break char.
+                next_arg_index = arg_index
+            end
+        end
+    end
 
     -- If arg_index is out of bounds we should loop if set or return to the
     -- previous matcher if possible.
@@ -350,15 +400,15 @@ function _argreader:update(word, word_index)
     -- Generate matches from history.
     if self._fromhistory_matcher then
         if self._fromhistory_matcher == matcher and self._fromhistory_argindex == arg_index then
-            if _argmatcher_fromhistory.builder then
-                _argmatcher_fromhistory.builder:addmatch(word, "word")
+            if clink.co_state._argmatcher_fromhistory.builder then
+                clink.co_state._argmatcher_fromhistory.builder:addmatch(word, "word")
             end
         end
     end
 
     -- Parse the word type.
     if self._word_classifier and word_index >= 0 then
-        if matcher._classify_func and matcher._classify_func(arg_index, word, word_index, line_state, self._word_classifier) then
+        if matcher._classify_func and matcher._classify_func(arg_index, word, word_index, line_state, self._word_classifier) then -- luacheck: ignore 542
             -- The classifier function says it handled the word.
         else
             -- Use the argmatcher's data to classify the word.
@@ -399,18 +449,41 @@ function _argreader:update(word, word_index)
                 if not matched then
                     local this_info = line_state:getwordinfo(word_index)
                     local pos = this_info.offset + this_info.length
-                    if line_state:getline():sub(pos, pos) == "=" then
+                    local line = line_state:getline()
+                    if line:sub(pos, pos) == "=" then
+                        -- If "word" is immediately followed by an equal sign,
+                        -- then check if "word=" is a recognized argument.
                         t, matched = is_word_present(word.."=", arg, t, arg_match_type)
                         if matched then
                             self._word_classifier:applycolor(pos, 1, get_classify_color(t))
                         end
                     end
                     if not matched then
-                        t, matched = is_word_present(word, arg, t, arg_match_type)
+                        if arg.loopchars then
+                            -- If the arg has looping characters defined, then
+                            -- split the word and apply colors to the sub-words.
+                            pos = this_info.offset
+                            local split = string.explode(word, arg.loopchars, '"')
+                            for _, w in ipairs(split) do
+                                t, matched = is_word_present(w, arg, t, arg_match_type)
+                                if matched then
+                                    local i = line:find(w, pos, true)
+                                    if i then
+                                        self._word_classifier:applycolor(i, #w, get_classify_color(t))
+                                        pos = i + #w
+                                    end
+                                end
+                            end
+                            t = nil
+                        else
+                            t, matched = is_word_present(word, arg, t, arg_match_type) -- luacheck: no unused
+                        end
                     end
                 end
             end
-            self._word_classifier:classifyword(word_index, t, false)
+            if t then
+                self._word_classifier:classifyword(word_index, t, false)
+            end
         end
     end
 
@@ -520,6 +593,27 @@ _argmatcher.__index = _argmatcher
 setmetatable(_argmatcher, { __call = function (x, ...) return x._new(...) end })
 
 --------------------------------------------------------------------------------
+local function append_uniq_chars(chars, find, add)
+    chars = chars or ""
+    find = find or "[]"
+    for i = 1, #add do
+        local c = add:sub(i, i)
+        if not chars:find(c, 1, true) then
+            local byte = string.byte(c)
+            local pct = ""
+            if byte < 97 or byte > 122 then -- <'a' or >'z'
+                pct = "%"
+            end
+            -- Update the list.
+            chars = chars .. c
+            -- Update the find expression.
+            find = find:sub(1, #find - 1) .. pct .. c .. "]"
+        end
+    end
+    return chars, find
+end
+
+--------------------------------------------------------------------------------
 local function apply_options_to_list(addee, list)
     if addee.nosort then
         list.nosort = true
@@ -534,6 +628,14 @@ local function apply_options_to_list(addee, list)
     end
     if addee.fromhistory then
         list.fromhistory = true
+    end
+    if addee.loopchars then
+        -- Apply looping characters, but avoid duplicates.
+        list.loopchars, list.loopcharsfind = append_uniq_chars(list.loopchars, list.loopcharsfind, addee.loopchars)
+    end
+    if addee.nodelimitchars then
+        -- Apply non-delimiter characters, but avoid duplicates.
+        list.nodelimitchars = append_uniq_chars(list.nodelimitchars, nil, addee.nodelimitchars)
     end
 end
 
@@ -552,20 +654,25 @@ local function apply_options_to_builder(reader, arg, builder)
 
     -- Generate matches from history, if requested.
     if arg.fromhistory then
-        -- Lua/C++/Lua language transition precludes running this in a
-        -- coroutine, but also the performance of this might not always be
-        -- responsive enough to run as often as suggestions would like to.
         local _, ismain = coroutine.running()
         if ismain then
-            _argmatcher_fromhistory.argmatcher = reader._matcher
-            _argmatcher_fromhistory.argslot = reader._arg_index
-            _argmatcher_fromhistory.builder = builder
+            clink.co_state._argmatcher_fromhistory.argmatcher = reader._matcher
+            clink.co_state._argmatcher_fromhistory.argslot = reader._arg_index
+            clink.co_state._argmatcher_fromhistory.builder = builder
             -- Let the C++ code iterate through the history and call back into
             -- Lua to parse individual history lines.
             clink._generate_from_history()
             -- Clear references.  Clear builder because it goes out of scope,
             -- and clear other references to facilitate garbage collection.
-            _argmatcher_fromhistory = {}
+            clink.co_state._argmatcher_fromhistory = {}
+        else
+            -- This can take a long time, depending on the size of the history.
+            -- So it isn't suitable to run in a suggestions coroutine.  However,
+            -- the menu-complete family of completion commands reuse available
+            -- match results, which then sees no matches.  So, the match
+            -- pipeline needs to be informed that matches will need to be
+            -- regenerated.
+            clink._reset_generate_matches()
         end
     end
 end
@@ -606,6 +713,12 @@ function _argmatcher:getdebugname()
 end
 
 --------------------------------------------------------------------------------
+function _argmatcher:setcmdcommand()
+    self._cmd_command = true
+    return self
+end
+
+--------------------------------------------------------------------------------
 --- -name:  _argmatcher:reset
 --- -ver:   1.3.10
 --- -ret:   self
@@ -626,6 +739,7 @@ function _argmatcher:reset()
     self._loop = nil
     self._no_file_generation = nil
     self._hidden = nil
+    self._cmd_command = nil
     self._classify_func = nil
     self._init_coroutine = nil
     self._init_generation = nil
@@ -637,12 +751,27 @@ end
 --- -ver:   1.0.0
 --- -arg:   choices...:string|table
 --- -ret:   self
---- This adds argument matches.  Arguments can be a string, a string linked to
---- another parser by the concatenation operator, a table of arguments, or a
---- function that returns a table of arguments.  See
+--- This adds a new argument position with the matches given by
+--- <span class="arg">choices</span>.  Arguments can be a string, a string
+--- linked to another parser by the concatenation operator, a table of
+--- arguments, or a function that returns a table of arguments.  See
 --- <a href="#argumentcompletion">Argument Completion</a> for more information.
---- -show:  local my_parser = clink.argmatcher("git")
---- -show:  :addarg("add", "status", "commit", "checkout")
+--- -show:  local my_parser = clink.argmatcher("make_color_shape")
+--- -show:  :addarg("red", "green", "blue")             -- 1st argument is a color
+--- -show:  :addarg("circle", "square", "triangle")     -- 2nd argument is a shape
+--- When providing a table of arguments, the table can contain some special
+--- entries:
+--- <p><table>
+--- <tr><th>Entry</th><th>More Info</th><th>Version</th></tr>
+--- <tr><td><code>delayinit=<span class="arg">function</span></code></td><td>See <a href="#addarg_delayinit">Delayed initialization for an argument position</a>.</td><td class="version">v1.3.10 and newer</td></tr>
+--- <tr><td><code>fromhistory=true</code></td><td>See <a href="#addarg_fromhistory">Generate Matches From History</a>.</td><td class="version">v1.3.9 and newer</td></tr>
+--- <tr><td><code>loopchars="<span class="arg">characters</span>"</code></td><td>See <a href="#addarg_loopchars">Delimited Arguments</a>.</td><td class="version">v1.3.37 and newer</td></tr>
+--- <tr><td><code>nosort=true</code></td><td>See <a href="#addarg_nosort">Disable Sorting Matches</a>.</td><td class="version">v1.3.3 and newer</td></tr>
+--- <tr><td><code>onarg=<span class="arg">function</span></code></td><td>See <a href="#responsive-argmatchers">Responding to Arguments in Argmatchers</a>.</td><td class="version">v1.3.13 and newer</td></tr>
+--- </table></p>
+--- <strong>Note:</strong>  Arguments are positional in an argmatcher.  Using
+--- <code>:addarg()</code> multiple times adds multiple argument positions, in
+--- the order they are specified.
 function _argmatcher:addarg(...)
     local list = self._args[self._nextargindex]
     if not list then
@@ -683,6 +812,18 @@ end
 --- -show:  local my_parser = clink.argmatcher("git")
 --- -show:  :addarg({ "add", "status", "commit", "checkout" })
 --- -show:  :addflags("-a", "-g", "-p", "--help")
+--- When providing a table of flags, the table can contain some special
+--- entries:
+--- <p><table>
+--- <tr><th>Entry</th><th>More Info</th><th>Version</th></tr>
+--- <tr><td><code>delayinit=<span class="arg">function</span></code></td><td>See <a href="#addarg_delayinit">Delayed initialization for an argument position</a>.</td><td class="version">v1.3.10 and newer</td></tr>
+--- <tr><td><code>fromhistory=true</code></td><td>See <a href="#addarg_fromhistory">Generate Matches From History</a>.</td><td class="version">v1.3.9 and newer</td></tr>
+--- <tr><td><code>nosort=true</code></td><td>See <a href="#addarg_nosort">Disable Sorting Matches</a>.</td><td class="version">v1.3.3 and newer</td></tr>
+--- <tr><td><code>onarg=<span class="arg">function</span></code></td><td>See <a href="#responsive-argmatchers">Responding to Arguments in Argmatchers</a>.</td><td class="version">v1.3.13 and newer</td></tr>
+--- </table></p>
+--- <strong>Note:</strong>  Flags are not positional in an argmatcher.  Using
+--- <code>:addarg()</code> multiple times with different flags is the same as
+--- using <code>:addarg()</code> once with all of the flags.
 function _argmatcher:addflags(...)
     local flag_matcher = self._flags or _argmatcher()
     local list = flag_matcher._args[1] or { _links = {} }
@@ -729,9 +870,9 @@ end
 --- -show:  local dirs = clink.argmatcher():addarg(clink.dirmatches)
 --- -show:  local my_parser = clink.argmatcher("mycommand")
 --- -show:  :addflags("-a", "--a", "--al", "--all",
---- -show:            "-d"..dirs, "--d"..dirs, "--di"..dirs, "--dir"..dirs)
+--- -show:  &nbsp;         "-d"..dirs, "--d"..dirs, "--di"..dirs, "--dir"..dirs)
 --- -show:  :hideflags("--a", "--al", "--all",      -- Only "-a" is displayed.
---- -show:             "-d", "--d", "--di")         -- Only "--dir" is displayed.
+--- -show:  &nbsp;          "-d", "--d", "--di")         -- Only "--dir" is displayed.
 function _argmatcher:hideflags(...)
     local flag_matcher = self._flags or _argmatcher()
     local list = flag_matcher._hidden or {}
@@ -948,23 +1089,47 @@ end
 --- -name:  _argmatcher:chaincommand
 --- -ver:   1.3.13
 --- -ret:   self
---- This makes the rest of the line be parsed as a separate command.  You can
---- use it to "chain" from one parser to another.
+--- This makes the rest of the line be parsed as a separate command, after the
+--- argmatcher reaches the end of its defined argument positions.  You can use
+--- it to "chain" from one parser to another.
 ---
---- For example, `cmd.exe program arg` is example of a line where one command
---- can have another command within it.  `:chaincommand()` enables `program arg`
---- to be parsed separately.  If `program` has an argmatcher, then it takes over
---- and parses the rest of the input line.
+--- For example, <code>cmd.exe program arg</code> is example of a line where one
+--- command can have another command within it.  <code>:chaincommand()</code>
+--- enables <code>program arg</code> to be parsed separately.  If
+--- <code>program</code> has an argmatcher, then it takes over and parses the
+--- rest of the input line.
+---
+--- An example that chains in a linked argmatcher:
 --- -show:  clink.argmatcher("program"):addflags("/x", "/y")
---- -show:  clink.argmatcher("cmd"):addflags("/c", "/k"):chaincommand()
+--- -show:  clink.argmatcher("cmd"):addflags(
+--- -show:  &nbsp;   "/c" .. clink.argmatcher():chaincommand(),
+--- -show:  &nbsp;   "/k" .. clink.argmatcher():chaincommand()
+--- -show:  ):nofiles()
 --- -show:  -- Consider the following input:
 --- -show:  --    cmd /c program /
 --- -show:  -- "cmd" is colored as an argmatcher.
 --- -show:  -- "/c" is colored as a flag (by the "cmd" argmatcher).
 --- -show:  -- "program" is colored as an argmatcher.
 --- -show:  -- "/" generates completions "/x" and "/y".
+---
+--- Examples that chain at the end of their argument positions:
+--- -show:  clink.argmatcher("program"):addflags("-x", "-y")
+--- -show:  clink.argmatcher("sometool"):addarg(
+--- -show:  &nbsp;   "exec" .. clink.argmatcher()
+--- -show:  &nbsp;               :addflags("-a", "-b")
+--- -show:  &nbsp;               :addarg("profile1", "profile2")
+--- -show:  &nbsp;               :chaincommand()
+--- -show:  )
+--- -show:  -- Consider the following input:
+--- -show:  --    sometool exec profile1 program -
+--- -show:  -- "sometool" is colored as an argmatcher.
+--- -show:  -- "exec" is colored as an argument (for "sometool").
+--- -show:  -- "profile1" is colored as an argument (for "exec").
+--- -show:  -- "program" is colored as an argmatcher.
+--- -show:  -- "-" generates completions "-x" and "-y".
 function _argmatcher:chaincommand()
     self._chain_command = true
+    self._no_file_generation = true -- So that pop() doesn't interfere.
     return self
 end
 
@@ -1066,10 +1231,9 @@ function _argmatcher:_is_flag(word)
         return false
     end
 
-    for i, num in pairs(self._flagprefix) do
-        if first_char == i then
-            return num > 0
-        end
+    local num = self._flagprefix[first_char]
+    if num ~= nil then
+        return num > 0
     end
 
     return false
@@ -1090,6 +1254,11 @@ end
 local function merge_parsers(lhs, rhs)
     -- Merging parsers is not a trivial matter and this implementation is far
     -- from correct.  It behaves reasonably for common cases.
+
+    -- Don't merge with itself!
+    if lhs == rhs then
+        return
+    end
 
     -- Merge flags.
     if rhs._flags then
@@ -1114,10 +1283,9 @@ local function merge_parsers(lhs, rhs)
     local rlinks = rhs_arg_1._links or {}
     for _, rarg in ipairs(rhs_arg_1) do
         local key
-        if type(key) == "table" then
-            key = key.match
-        end
-        if not key then
+        if type(rarg) == "table" then
+            key = rarg.match or rarg
+        else
             key = rarg
         end
 
@@ -1250,19 +1418,19 @@ function _argmatcher:_generate(line_state, match_builder, extra_words)
     end
 
     -- Consume words and use them to move through matchers' arguments.
-    local word_count = line_state:getwordcount()
     local command_word_index = line_state:getcommandwordindex()
-    for word_index = command_word_index + 1, (word_count - 1) do
+    for word_index = command_word_index + 1, (line_state:getwordcount() - 1) do
         local info = line_state:getwordinfo(word_index)
         if not info.redir then
             local word = line_state:getword(word_index)
-            if reader:update(word, word_index) then
+            if reader:update(word, word_index, true--[[skip_last]]) then
                 return true, word_index
             end
         end
     end
 
     -- If not generating matches, then just consume the end word and return.
+    local word_count = line_state:getwordcount()
     if not match_builder then
         reader:update(line_state:getword(word_count), word_count)
         return
@@ -1285,9 +1453,8 @@ function _argmatcher:_generate(line_state, match_builder, extra_words)
 
     -- Are we left with a valid argument that can provide matches?
     local add_matches -- Separate decl and init to enable recursion.
-    add_matches = function(arg, match_type)
+    add_matches = function(arg, match_type) -- luacheck: ignore 431
         local descs = matcher._descriptions
-        local is_arg_type = match_type == "arg"
         local make_match = function(key)
             local m = {}
             local t = type(key)
@@ -1321,6 +1488,12 @@ function _argmatcher:_generate(line_state, match_builder, extra_words)
                 end
             end
             return m
+        end
+
+        if matcher._deprecated then
+            -- Mark the build as deprecated, so it can infer match types the
+            -- old way.
+            match_builder:deprecated_addmatch()
         end
 
         apply_options_to_builder(reader, arg, match_builder)
@@ -1367,7 +1540,7 @@ function _argmatcher:_generate(line_state, match_builder, extra_words)
         -- matches.
         match_builder:addmatches(clink.filematches(line_state:getendword()))
         return true
-    elseif matcher._flags and matcher:_is_flag(line_state:getendword()) then
+    elseif not reader._noflags and matcher._flags and matcher:_is_flag(line_state:getendword()) then
         -- Flags are always "arg" type, which helps differentiate them from
         -- filename completions even when using _deprecated matcher mode, so
         -- that path normalization can avoid affecting flags like "/c", etc.
@@ -1376,7 +1549,7 @@ function _argmatcher:_generate(line_state, match_builder, extra_words)
         return true
     elseif reader._phantomposition then
         -- Generate file matches for phantom positions, i.e. any flag ending
-        -- with : or = that does explicitly link to another matcher.
+        -- with : or = that does not explicitly link to another matcher.
         match_builder:addmatches(clink.filematches(line_state:getendword()))
         return true
     else
@@ -1384,6 +1557,9 @@ function _argmatcher:_generate(line_state, match_builder, extra_words)
         local arg = matcher._args[arg_index]
         if arg then
             return add_matches(arg, match_type) and true or false
+        elseif matcher._chain_command then
+            local exec = clink._exec_matches(line_state, match_builder, true--[[chained]])
+            return exec or add_matches({clink.filematches}) or false
         end
     end
 
@@ -1472,9 +1648,10 @@ end
 --- -deprecated: _argmatcher:addflags
 --- -arg:   flags...:string
 --- -ret:   self
---- Note:  The new API has no way to remove flags that were previously added, so
---- converting from <code>:set_flags()</code> to <code>:addflags()</code> may
---- require the calling script to reorganize how and when it adds flags.
+--- <strong>Note:</strong>  The new API has no way to remove flags that were
+--- previously added, so converting from <code>:set_flags()</code> to
+--- <code>:addflags()</code> may require the calling script to reorganize how
+--- and when it adds flags.
 function _argmatcher:set_flags(...)
     self._flags = nil
     self:addflags(...)
@@ -1511,6 +1688,27 @@ if settings.get("lua.debug") or clink.DEBUG then
 end
 
 --------------------------------------------------------------------------------
+local function get_creation_srcinfo()
+    local first, src
+    for level = 3, 10 do
+        local info = debug.getinfo(level, "Sl")
+        if not info then
+            break
+        end
+        src = info.short_src..":"..info.currentline
+        if not first then
+            first = src
+        end
+        -- Favor returning a user script location.
+        if not clink._is_internal_script(info.short_src) then
+            return src
+        end
+    end
+    -- If no user script location, return the original internal location.
+    return first or "?"
+end
+
+--------------------------------------------------------------------------------
 --- -name:  clink.argmatcher
 --- -ver:   1.0.0
 --- -arg:   [priority:integer]
@@ -1525,6 +1723,14 @@ end
 --- argmatcher for it, then this returns the existing parser rather than
 --- creating a new parser.  Using :addarg() starts at arg position 1, making it
 --- possible to merge new args and etc into the existing parser.
+---
+--- In Clink v1.3.38 and higher, if a <span class="arg">command</span> is a
+--- fully qualified path, then it is only used when the typed command expands to
+--- the same fully qualified path.  This makes it possible to create one
+--- argmatcher for <code>c:\general\program.exe</code> and another for
+--- <code>c:\special\program.exe</code>.  For example, aliases may be used to
+--- make both programs runnable, or the system PATH might be changed temporarily
+--- while working in a particular context.
 ---
 --- <strong>Note:</strong>  Merging <a href="#linked-parsers">linked
 --- argmatchers</a> only merges the first argument position.  The merge is
@@ -1541,7 +1747,7 @@ function clink.argmatcher(...)
     -- If multiple commands are listed, merging isn't supported.
     local matcher = nil
     for _, i in ipairs(input) do
-        matcher = _argmatchers[clink.lower(i)]
+        matcher = _argmatchers[path.normalise(clink.lower(i))]
         if #input <= 1 then
             break
         end
@@ -1562,8 +1768,12 @@ function clink.argmatcher(...)
         matcher = _argmatcher()
         matcher._priority = priority
         for _, i in ipairs(input) do
-            _argmatchers[clink.lower(i)] = matcher
+            _argmatchers[path.normalise(clink.lower(i))] = matcher
         end
+    end
+
+    if matcher then
+        matcher._srccreated = get_creation_srcinfo()
     end
 
     return matcher
@@ -1647,29 +1857,192 @@ end
 
 
 --------------------------------------------------------------------------------
-local function _has_argmatcher(command_word)
-    command_word = clink.lower(command_word)
+local function _is_argmatcher_loaded(command_word, quoted)
+    local argmatcher
 
-    -- Check for an exact match.
-    local argmatcher = _argmatchers[path.getname(command_word)]
-    if argmatcher then
-        return argmatcher
+    repeat
+        -- Check for an exact match.
+        argmatcher = _argmatchers[command_word]
+        if argmatcher then
+            break
+        end
+
+        -- Check for a name match.
+        argmatcher = _argmatchers[path.getname(command_word)]
+        if argmatcher then
+            break
+        end
+
+        -- If the extension is in PATHEXT then try stripping the extension.
+        if path.isexecext(command_word) then
+            argmatcher = _argmatchers[path.getbasename(command_word)]
+            if argmatcher and argmatcher._cmd_command then
+                -- CMD commands do not have extensions.
+                argmatcher = nil
+            end
+            if argmatcher then
+                break
+            end
+        end
+    until true
+
+    if quoted and argmatcher and argmatcher._cmd_command then
+        -- CMD commands cannot be quoted.
+        argmatcher = nil
     end
 
-    -- If the extension is in PATHEXT then try stripping the extension.
-    if path.isexecext(command_word) then
-        argmatcher = _argmatchers[path.getbasename(command_word)]
-        if argmatcher then
-            return argmatcher
+    return argmatcher
+end
+
+--------------------------------------------------------------------------------
+local loaded_argmatchers = {}
+
+--------------------------------------------------------------------------------
+local function add_dirs_from_var(t, var, subdir)
+    if var and var ~= "" then
+        local dirs = string.explode(var, ";", '"')
+        for _,d in ipairs(dirs) do
+            d = rl.expandtilde(d:gsub('"', ""))
+            if subdir then
+                d = path.join(d, "completions")
+            end
+            d = path.getdirectory(path.join(d, "")) -- Makes sure no trailing path separator.
+            table.insert(t, d)
+        end
+        return true
+    end
+end
+
+--------------------------------------------------------------------------------
+local _completion_dirs_str = ""
+local _completion_dirs_list = {}
+function clink._set_completion_dirs(str)
+    if str ~= _completion_dirs_str then
+        local dirs = {}
+
+        _completion_dirs_str = str
+        _completion_dirs_list = dirs
+
+        add_dirs_from_var(dirs, os.getenv("CLINK_COMPLETIONS_DIR"), false)
+        for _,d in ipairs(string.explode(str, ";", '"')) do
+            add_dirs_from_var(dirs, d, true)
         end
     end
+end
+
+--------------------------------------------------------------------------------
+local function get_completion_dirs()
+    return _completion_dirs_list
+end
+
+--------------------------------------------------------------------------------
+local function attempt_load_argmatcher(command_word, quoted)
+    if not command_word or command_word == "" then
+        return
+    end
+
+    -- Make sure scripts aren't loaded multiple times.
+    loaded_argmatchers[command_word] = 1 -- Attempted.
+
+    -- Device names are not valid commands.
+    if path.isdevice(command_word) then
+        return
+    end
+
+    -- Where to look.
+    local dirs = get_completion_dirs()
+
+    -- What to look for.
+    local primary = path.getname(command_word)..".lua"
+    local secondary
+    if path.isexecext(command_word) then
+        secondary = path.getbasename(command_word)
+        if secondary == "" then
+            secondary = nil
+        else
+            secondary = secondary..".lua"
+        end
+    end
+
+    -- Look for file.
+    local loaded = {}
+    for _,d in ipairs(dirs) do
+        if d ~= "" then
+            local file = path.join(d, primary)
+            if not os.isfile(file) then
+                if not secondary then
+                    file = nil
+                else
+                    file = path.join(d, secondary)
+                    if not os.isfile(file) then
+                        file = nil
+                    end
+                end
+            end
+            if file and not loaded[file] then
+                loaded[file] = true
+                loaded_argmatchers[command_word] = 2 -- Attempted and Loaded.
+                -- Load the file.
+                dofile(file)
+                -- Check again, and stop if argmatcher is loaded.
+                local argmatcher = _is_argmatcher_loaded(command_word, quoted)
+                if argmatcher then
+                    loaded_argmatchers[command_word] = 3 -- Attempted, loaded, and has argmatcher.
+                    return argmatcher
+                end
+            end
+        end
+    end
+end
+
+--------------------------------------------------------------------------------
+-- This checks if an argmatcher is already loaded for the specified word.  If
+-- not, then it looks for a Lua script by that name in one of the completions
+-- directories.  If found, the script is loaded, and it checks again whether an
+-- argmatcher is already loaded for the specified word.
+local function _has_argmatcher(command_word, quoted)
+    if not command_word or command_word == "" then
+        return
+    end
+
+    command_word = clink.lower(command_word:gsub("/", "\\"))
+
+    -- Don't invoke the recognizer while generating matches from history, as
+    -- that could be excessively expensive (could queue thousands of lookups).
+    if not (clink.co_state._argmatcher_fromhistory and clink.co_state._argmatcher_fromhistory.argmatcher) then
+        -- Pass true because argmatcher lookups always treat ^ literally.
+        local _, _, file = clink.recognizecommand(command_word, true)
+        if file then
+            command_word = file
+        end
+    end
+
+    local argmatcher = _is_argmatcher_loaded(command_word, quoted)
+
+    -- If an argmatcher isn't loaded, look for a Lua script by that name in one
+    -- of the completions directories.  If found, load it and check again.
+    if not argmatcher and not loaded_argmatchers[command_word] then
+        argmatcher = attempt_load_argmatcher(command_word, quoted)
+    end
+
+    if argmatcher and not (clink.co_state._argmatcher_fromhistory and clink.co_state._argmatcher_fromhistory.argmatcher) then
+        local alias = os.getalias(command_word)
+        if not alias or alias == "" then
+            -- Avoid coloring directories as having argmatchers.
+            if clink._async_path_type(command_word, 15, clink.reclassifyline) == "dir" then
+                return
+            end
+        end
+    end
+
+    return argmatcher
 end
 
 --------------------------------------------------------------------------------
 local function _do_onuse_callback(argmatcher, command_word)
     -- Don't init while generating matches from history, as that could be
     -- excessively expensive (could run thousands of callbacks).
-    if _argmatcher_fromhistory and _argmatcher_fromhistory.argmatcher then
+    if clink.co_state._argmatcher_fromhistory and clink.co_state._argmatcher_fromhistory.argmatcher then
         return
     end
 
@@ -1691,11 +2064,15 @@ local function _do_onuse_callback(argmatcher, command_word)
             argmatcher._onuse_coroutine = nil
             _clear_onuse_coroutine[argmatcher] = nil
             if async_delayinit then
-                clink._invalidate_matches()
+                clink._signal_delayed_init()
                 clink.reclassifyline()
             end
         end)
         argmatcher._onuse_coroutine = c
+
+        -- Make sure the delayinit coroutine runs to completion, even if a new
+        -- prompt generation begins (which would normally orphan coroutines).
+        clink.runcoroutineuntilcomplete(c)
 
         -- Set up to be able to efficiently clear dangling coroutine references,
         -- e.g. in case a coroutine doesn't finish before a new edit line.
@@ -1709,7 +2086,12 @@ local function _do_onuse_callback(argmatcher, command_word)
     else
         -- Run the coroutine up to the first yield, so that if it doesn't need
         -- to yield at all then it completes right now.
-        coroutine.resume(c)
+        local ok, ret = coroutine.resume(c)
+        if not ok and ret and settings.get("lua.debug") then
+            print("")
+            print("coroutine failed:")
+            _co_error_handler(c, ret)
+        end
     end
 end
 
@@ -1730,29 +2112,26 @@ local function _find_argmatcher(line_state, check_existence, lookup)
     end
 
     local command_word = lookup or line_state:getword(command_word_index)
-    local argmatcher = _has_argmatcher(command_word)
-    if argmatcher then
-        if check_existence then
-            argmatcher = nil
-        elseif argmatcher._delayinit_func then
-            _do_onuse_callback(argmatcher, command_word)
-        end
-        return argmatcher, true
+    local info = not lookup and line_state:getwordinfo(command_word_index)
+    if not command_word or command_word == "" then
+        return
     end
 
-    if command_word_index == 1 and not lookup then
-        local info = line_state:getwordinfo(1)
-        local next_ofs = info.offset + info.length
-        local next_char = line_state:getline():sub(next_ofs, next_ofs)
-        if next_char == "" or next_char == " " or next_char == "\t" then
+    if command_word_index == 1 and not lookup and info and not info.quoted then
+        local command_offset = line_state:getcommandoffset()
+        if not line_state:getline():sub(command_offset, command_offset):find("[ \t]") then
             local alias = os.getalias(command_word)
             if alias and alias ~= "" then
                 -- This doesn't even try to handle redirection symbols in the alias
                 -- because the cost/benefit ratio is unappealing.
                 alias = alias:gsub("%$.*$", "")
                 local words = string.explode(alias, " \t", '"')
-                if #words > 0 then
-                    argmatcher = _has_argmatcher(words[1])
+                if words[1] then
+                    -- FUTURE:  Ideally this could detect whether the word was
+                    -- quoted so that e.g. `"cd"` in an alias doesn't resolve to
+                    -- the built-in CD command argmatcher.  But it's a weird
+                    -- edge case and isn't worth the complexity.
+                    local argmatcher = _has_argmatcher(words[1])
                     if argmatcher then
                         if check_existence then
                             argmatcher = nil
@@ -1764,6 +2143,27 @@ local function _find_argmatcher(line_state, check_existence, lookup)
                 end
             end
         end
+    end
+
+    -- Don't invoke the recognizer while generating matches from history, as
+    -- that could be excessively expensive (could queue thousands of lookups).
+    if not (clink.co_state._argmatcher_fromhistory and clink.co_state._argmatcher_fromhistory.argmatcher) then
+        -- Pass true because argmatcher lookups always treat ^ literally.
+        local _, _, file = clink.recognizecommand(command_word, true)
+        if file then
+            command_word = file
+            info = nil
+        end
+    end
+
+    local argmatcher = _has_argmatcher(command_word, info and info.quoted)
+    if argmatcher then
+        if check_existence then
+            argmatcher = nil
+        elseif argmatcher._delayinit_func then
+            _do_onuse_callback(argmatcher, command_word)
+        end
+        return argmatcher, true
     end
 end
 
@@ -1784,7 +2184,12 @@ end
 function clink.getargmatcher(find)
     local t = type(find)
     if t == "string" then
-        return _has_argmatcher(find)
+        local quoted
+        if find:match('^".*"$') then
+            quoted = true
+            find = find:gsub('^"(.*)"$', '%1')
+        end
+        return _has_argmatcher(find, quoted)
     elseif t == "userdata" then
         return _find_argmatcher(find)
     else
@@ -1796,15 +2201,15 @@ end
 function clink._generate_from_historyline(line_state)
     local lookup
 ::do_command::
-    local argmatcher, has_argmatcher, extra_words = _find_argmatcher(line_state, nil, lookup)
-    if not argmatcher or argmatcher ~= _argmatcher_fromhistory_root then
+    local argmatcher, has_argmatcher, extra_words = _find_argmatcher(line_state, nil, lookup) -- luacheck: no unused
+    if not argmatcher or argmatcher ~= clink.co_state._argmatcher_fromhistory_root then
         return
     end
     lookup = nil
 
     local reader = _argreader(argmatcher, line_state)
-    reader._fromhistory_matcher = _argmatcher_fromhistory.argmatcher
-    reader._fromhistory_argindex = _argmatcher_fromhistory.argslot
+    reader._fromhistory_matcher = clink.co_state._argmatcher_fromhistory.argmatcher
+    reader._fromhistory_argindex = clink.co_state._argmatcher_fromhistory.argslot
 
     -- Consume extra words from expanded doskey alias.
     if extra_words then
@@ -1817,9 +2222,8 @@ function clink._generate_from_historyline(line_state)
     end
 
     -- Consume words and use them to move through matchers' arguments.
-    local word_count = line_state:getwordcount()
     local command_word_index = line_state:getcommandwordindex()
-    for word_index = command_word_index + 1, word_count do
+    for word_index = command_word_index + 1, line_state:getwordcount() do
         local info = line_state:getwordinfo(word_index)
         if not info.redir then
             local word = line_state:getword(word_index)
@@ -1842,8 +2246,8 @@ local argmatcher_classifier = clink.classifier(clink.argmatcher_generator_priori
 local function do_generate(line_state, match_builder)
     local lookup
 ::do_command::
-    local argmatcher, has_argmatcher, extra_words = _find_argmatcher(line_state, nil, lookup)
-    lookup = nil
+    local argmatcher, has_argmatcher, extra_words = _find_argmatcher(line_state, nil, lookup) -- luacheck: no unused
+    lookup = nil -- luacheck: ignore 311
     if argmatcher then
         clink.co_state._argmatcher_fromhistory = {}
         clink.co_state._argmatcher_fromhistory_root = argmatcher
@@ -1862,7 +2266,7 @@ local function do_generate(line_state, match_builder)
 end
 
 --------------------------------------------------------------------------------
-function argmatcher_generator:generate(line_state, match_builder)
+function argmatcher_generator:generate(line_state, match_builder) -- luacheck: no unused
     if clink.co_state.argmatcher_line_states then
         local num = #clink.co_state.argmatcher_line_states - 1
         for i = 1, num do
@@ -1875,10 +2279,10 @@ function argmatcher_generator:generate(line_state, match_builder)
 end
 
 --------------------------------------------------------------------------------
-function argmatcher_generator:getwordbreakinfo(line_state)
+function argmatcher_generator:getwordbreakinfo(line_state) -- luacheck: no self
     local lookup
 ::do_command::
-    local argmatcher, has_argmatcher, extra_words = _find_argmatcher(line_state, nil, lookup)
+    local argmatcher, has_argmatcher, extra_words = _find_argmatcher(line_state, nil, lookup) -- luacheck: no unused
     lookup = nil
     if argmatcher then
         local reader = _argreader(argmatcher, line_state)
@@ -1894,23 +2298,39 @@ function argmatcher_generator:getwordbreakinfo(line_state)
         end
 
         -- Consume words and use them to move through matchers' arguments.
-        local word_count = line_state:getwordcount()
         local command_word_index = line_state:getcommandwordindex()
-        for word_index = command_word_index + 1, (word_count - 1) do
+        for word_index = command_word_index + 1, (line_state:getwordcount() - 1) do
             local info = line_state:getwordinfo(word_index)
             if not info.redir then
                 local word = line_state:getword(word_index)
-                if reader:update(word, word_index) then
+                if reader:update(word, word_index, true--[[skip_last]]) then
                     line_state:shift(word_index)
                     goto do_command
                 end
             end
         end
 
+        -- Looping characters are also word break characters.
+        argmatcher = reader._matcher
+        local arg = argmatcher._args[reader._arg_index]
+        if arg and arg.loopchars then
+            local word = line_state:getendword()
+            local pos = 0
+            while true do
+                local next = word:find(arg.loopcharsfind, pos + 1)
+                if not next then
+                    break
+                end
+                pos = next
+            end
+            if pos > 0 then
+                return pos, 0
+            end
+        end
+
         -- There should always be a matcher left on the stack, but the arg_index
         -- could be well out of range.
-        argmatcher = reader._matcher
-        if argmatcher and argmatcher._flags then
+        if not reader._noflags and argmatcher and argmatcher._flags then
             local word = line_state:getendword()
             if argmatcher:_is_flag(word) then
                 -- Accommodate `-flag:text` and `-flag=text` (with or without
@@ -1928,7 +2348,7 @@ function argmatcher_generator:getwordbreakinfo(line_state)
 end
 
 --------------------------------------------------------------------------------
-function argmatcher_classifier:classify(commands)
+function argmatcher_classifier:classify(commands) -- luacheck: no self
     local unrecognized_color = settings.get("color.unrecognized") ~= ""
     local executable_color = settings.get("color.executable") ~= ""
     for _,command in ipairs(commands) do
@@ -1941,7 +2361,6 @@ function argmatcher_classifier:classify(commands)
         local command_word_index = line_state:getcommandwordindex()
         lookup = nil
 
-        local word_count = line_state:getwordcount()
         local command_word = line_state:getword(command_word_index) or ""
         if #command_word > 0 then
             local info = line_state:getwordinfo(command_word_index)
@@ -1980,7 +2399,7 @@ function argmatcher_classifier:classify(commands)
             end
 
             -- Consume words and use them to move through matchers' arguments.
-            for word_index = command_word_index + 1, word_count do
+            for word_index = command_word_index + 1, line_state:getwordcount() do
                 local info = line_state:getwordinfo(word_index)
                 if not info.redir then
                     local word = line_state:getword(word_index)
@@ -1995,6 +2414,96 @@ function argmatcher_classifier:classify(commands)
     end
 
     return false -- continue
+end
+
+
+
+--------------------------------------------------------------------------------
+local function spairs(t, order)
+    -- collect the keys
+    local keys = {}
+    for k in pairs(t) do keys[#keys+1] = k end
+
+    -- if order function given, sort by it by passing the table and keys a, b,
+    -- otherwise just sort the keys
+    if order then
+        table.sort(keys, function(a,b) return order(t, a, b) end)
+    else
+        table.sort(keys)
+    end
+
+    -- return the iterator function
+    local i = 0
+    return function()
+        i = i + 1
+        if keys[i] then
+            return keys[i], t[keys[i]]
+        end
+    end
+end
+
+--------------------------------------------------------------------------------
+function clink._diag_argmatchers()
+    local bold = "\x1b[1m"          -- Bold (bright).
+    local norm = "\x1b[m"           -- Normal.
+
+    clink.print(bold.."argmatchers:"..norm)
+
+    local width = 0
+    for k,_ in pairs(_argmatchers) do
+        if width < #k then
+            width = #k
+        end
+    end
+
+    local any = false
+    local fmt = "  %-"..width.."s  :  %s"
+    for k,v in spairs(_argmatchers) do
+        local src = v._srccreated
+        if src and not clink._is_internal_script(src) then
+            any = true
+            clink.print(string.format(fmt, k, src))
+        end
+    end
+    if not any then
+        clink.print("  none")
+    end
+end
+
+--------------------------------------------------------------------------------
+function clink._diag_completions_dirs()
+    local bold = "\x1b[1m"          -- Bold (bright).
+    local norm = "\x1b[m"           -- Normal.
+
+    clink.print(bold.."completions:"..norm)
+
+    clink.print("  completions lookup directories:")
+
+    local dirs = get_completion_dirs()
+    for _,d in ipairs(dirs) do
+        clink.print("", d)
+    end
+
+    clink.print("  completions lookup statistics:")
+
+    local attempted = 0
+    local loaded = 0
+    local found = 0
+    for _,v in pairs(loaded_argmatchers) do
+        if v >= 1 then
+            attempted = attempted + 1
+        end
+        if v >= 2 then
+            loaded = loaded + 1
+        end
+        if v >= 3 then
+            found = found + 1
+        end
+    end
+
+    clink.print("", "commands searched:", attempted)
+    clink.print("", "Lua scripts loaded:", loaded)
+    clink.print("", "argmatchers loaded:", found)
 end
 
 
@@ -2067,6 +2576,9 @@ function clink.arg.new_parser(...)
             error(msg, 2)
         end
     end
+    if parser then
+        parser._srccreated = get_creation_srcinfo()
+    end
     return parser
 end
 
@@ -2102,9 +2614,15 @@ end
 --- -show:  -- In v1.3.11 and higher this syntax ends up with all 4 first argument strings
 --- -show:  -- having both "old_second" and "new_second" as a second argument.
 function clink.arg.register_parser(cmd, parser)
-    cmd = clink.lower(cmd)
+    cmd = path.normalise(clink.lower(cmd))
 
-    if parser and parser._deprecated then
+    if not parser or getmetatable(parser) ~= _argmatcher then
+        local p = clink.arg.new_parser()
+        p:set_arguments({ parser })
+        parser = p
+    end
+
+    if parser._deprecated then
         clink._mark_deprecated_argmatcher(cmd)
     end
 

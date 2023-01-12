@@ -1010,6 +1010,9 @@ rl_insert (int count, int c)
 	break;
     }
 
+/* begin_clink_change */
+  assert(n != 0); /* rl_read_key() must not return 0 after _rl_input_queued() returns non-zero. */
+/* end_clink_change */
   if (n != (unsigned short)-2)		/* -2 = sentinel value for having inserted N */
     {
       /* setting rl_pending_input inhibits setting rl_last_func so we do it
@@ -1303,6 +1306,7 @@ _rl_rubout_char (int count, int key)
     {
       c = rl_line_buffer[--rl_point];
       rl_delete_text (rl_point, orig_point);
+#if !defined (OMIT_DEFAULT_DISPLAY_READLINE)
       /* The erase-at-end-of-line hack is of questionable merit now. */
       if (rl_point == rl_end && ISPRINT ((unsigned char)c) && _rl_last_c_pos)
 	{
@@ -1310,6 +1314,7 @@ _rl_rubout_char (int count, int key)
 	  l = rl_character_len (c, rl_point);
 	  _rl_erase_at_end_of_line (l);
 	}
+#endif /* OMIT_DEFAULT_DISPLAY_READLINE */
     }
   else
     {

@@ -32,7 +32,7 @@ simple_word_tokeniser::~simple_word_tokeniser()
 }
 
 //------------------------------------------------------------------------------
-void simple_word_tokeniser::start(const str_iter& iter, const char* quote_pair)
+void simple_word_tokeniser::start(const str_iter& iter, const char* quote_pair, bool at_beginning)
 {
     delete m_tokeniser;
     m_start = iter.get_pointer();
@@ -46,11 +46,13 @@ word_token simple_word_tokeniser::next(unsigned int& offset, unsigned int& lengt
     const char* ptr;
     int len;
     str_token token = m_tokeniser->next(ptr, len);
-    if (!token)
-        return word_token(word_token::invalid_delim);
 
     offset = static_cast<unsigned int>(ptr - m_start);
     length = len;
+
+    if (!token)
+        return word_token(word_token::invalid_delim);
+
     return word_token(token.delim);
 }
 
@@ -122,6 +124,14 @@ void word_collector::find_command_bounds(const char* buffer, unsigned int length
                                cursor <= command_start + command_length))
             return;
     }
+
+    // Catch uninitialized variables.
+    assert(command_start < 0xccccc);
+    assert(command_length < 0xccccc);
+
+    // Need to provide an empty command, because there's an empty command.  For
+    // example exec.enable needs this so it can generate matches appropriately.
+    commands.push_back({ command_start, command_length });
 }
 
 //------------------------------------------------------------------------------
@@ -145,9 +155,11 @@ unsigned int word_collector::collect_words(const char* line_buffer, unsigned int
 
     unsigned int command_offset = 0;
 
+    bool first = true;
     for (auto& command : commands)
     {
-        bool first = true;
+        first = true;
+
         unsigned int doskey_len = 0;
         bool deprecated_argmatcher = false;
 
@@ -179,7 +191,7 @@ unsigned int word_collector::collect_words(const char* line_buffer, unsigned int
             }
         }
 
-        m_word_tokeniser->start(str_iter(line_buffer + command.offset + doskey_len, command.length - doskey_len), m_quote_pair);
+        m_word_tokeniser->start(str_iter(line_buffer + command.offset + doskey_len, command.length - doskey_len), m_quote_pair, first);
         while (1)
         {
             unsigned int word_offset = 0;
@@ -187,6 +199,15 @@ unsigned int word_collector::collect_words(const char* line_buffer, unsigned int
             word_token token = m_word_tokeniser->next(word_offset, word_length);
             if (!token)
                 break;
+
+            // Plus sign is never a word break immediately after a space.
+            if (word_offset >= 2 &&
+                line_buffer[word_offset - 1] == '+' &&
+                line_buffer[word_offset - 2] == ' ')
+            {
+                word_offset--;
+                word_length++;
+            }
 
             word_offset += command.offset + doskey_len;
             const char* word_start = line_buffer + word_offset;
@@ -200,7 +221,7 @@ unsigned int word_collector::collect_words(const char* line_buffer, unsigned int
             // abstraction between collecting words and running argmatchers
             // breaks down here.
             //
-            // Rather that redesign the system or dream up a complex solution,
+            // Rather than redesign the system or dream up a complex solution,
             // we'll use a simple(ish) mitigation that works the vast majority
             // of the time because / and - are the only flag characters in
             // widespread use.
@@ -255,7 +276,7 @@ unsigned int word_collector::collect_words(const char* line_buffer, unsigned int
     word* end_word = words.empty() ? nullptr : &words.back();
     if (!end_word || (stop_at_cursor && end_word->offset + end_word->length < line_cursor))
     {
-        words.push_back({line_cursor, 0, !end_word});
+        words.push_back({line_cursor, 0, first});
     }
 
     // Adjust for quotes.
@@ -328,6 +349,8 @@ void commands::set(const char* line_buffer, unsigned int line_length, unsigned i
             // before it, so that ` doskeyalias` gets classified as NOT a doskey
             // alias, since doskey::resolve() won't expand it as a doskey alias.
             int command_char_offset = tmp[0].offset;
+            if (tmp[0].quoted)
+                command_char_offset--;
             if (command_char_offset == 1 && line_buffer[0] == ' ')
                 command_char_offset--;
             else if (command_char_offset >= 2 &&

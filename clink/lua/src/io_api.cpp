@@ -15,13 +15,10 @@
 #include <io.h>
 #include <stdio.h>
 #include <process.h>
+#include <share.h>
 #include <list>
 #include <memory>
 #include <assert.h>
-
-#ifndef _MSC_VER
-#define USE_PORTABLE
-#endif
 
 //------------------------------------------------------------------------------
 struct popenrw_info;
@@ -152,10 +149,15 @@ static int pclosefile(lua_State *state)
     intptr_t process_handle = info->get_wait_handle();
     if (process_handle)
     {
+        int stat = 0;
         bool wait = !info->is_async();
         popenrw_info::remove(info);
         delete info;
-        return luaL_execresult(state, wait ? pclosewait(process_handle) : 0);
+        if (wait)
+            stat = pclosewait(process_handle);
+        else
+            CloseHandle(HANDLE(process_handle));
+        return luaL_execresult(state, stat);
     }
 
     return luaL_fileresult(state, (res == 0), NULL);
@@ -238,13 +240,44 @@ struct popen_buffering : public yield_thread
             fclose(m_read);
         if (m_write)
             CloseHandle(m_write);
+        if (m_stat_event)
+            CloseHandle(m_stat_event);
+        if (m_process_handle)
+            CloseHandle(m_process_handle);
     }
 
-    int results(lua_State*) override
+    bool createthread()
     {
-        // Should never be called (see io.popenyield in coroutines.lua).
-        assert(false);
-        return 0;
+        assert(!m_stat_event);
+        m_stat_event = CreateEvent(nullptr, true, false, nullptr);
+        if (!m_stat_event)
+            return false;
+        return yield_thread::createthread();
+    }
+
+    void go(HANDLE process_handle)
+    {
+        assert(!m_process_handle);
+        m_process_handle = os::dup_handle(GetCurrentProcess(), process_handle);
+        yield_thread::go();
+    }
+
+    HANDLE get_ready_event() override
+    {
+        if (m_need_completion)
+            return m_stat_event;
+        return yield_thread::get_ready_event();
+    }
+
+    void set_need_completion() override
+    {
+        m_need_completion = true;
+    }
+
+    int results(lua_State* state) override
+    {
+        errno = m_errno;
+        return luaL_execresult(state, m_stat);
     }
 
 private:
@@ -274,10 +307,28 @@ private:
         m_write = nullptr;
     }
 
-    FILE* m_read;
-    HANDLE m_write;
+    bool do_completion() override
+    {
+        if (!m_stat_event || !m_process_handle)
+            return false;
 
-    BYTE m_buffer[4096];
+        m_stat = pclosewait(intptr_t(m_process_handle));
+        m_errno = errno;
+        m_process_handle = 0;
+        SetEvent(m_stat_event);
+        return true;
+    }
+
+    FILE*           m_read;
+    HANDLE          m_write;
+    HANDLE          m_stat_event = 0;
+    HANDLE          m_process_handle = 0;
+
+    int             m_stat = -1;
+    errno_t         m_errno = 0;
+    volatile long   m_need_completion = false;
+
+    BYTE            m_buffer[4096];
 };
 
 
@@ -407,6 +458,7 @@ private:
 
     luaL_Stream* pr = nullptr;
     luaL_YieldGuard* yg = nullptr;
+    pipe_pair pipe_stdin;
     pipe_pair pipe_stdout;
 
     pr = (luaL_Stream*)lua_newuserdata(state, sizeof(luaL_Stream));
@@ -439,7 +491,10 @@ private:
             break;
 
         // The pipe and temp_write are both binary to simplify the thread's job.
-        if (!pipe_stdout.init(false/*write*/, true/*binary*/))
+        // Must provide pipe_stdin to the spawned process, or some processes may
+        // error out due to missing stdin handle (e.g. FC and XCOPY).
+        if (!pipe_stdin.init(true/*write*/, true/*binary*/) ||
+            !pipe_stdout.init(false/*write*/, true/*binary*/))
             break;
 
         buffering = std::make_shared<popen_buffering>(pipe_stdout.local, temp_write);
@@ -449,7 +504,7 @@ private:
             break;
 
         info = new popenrw_info;
-        HANDLE process_handle = os::spawn_internal(command, nullptr, NULL, pipe_stdout.remote);
+        HANDLE process_handle = os::spawn_internal(command, nullptr, pipe_stdin.remote, pipe_stdout.remote);
         if (!process_handle)
             break;
 
@@ -464,7 +519,7 @@ private:
         info = nullptr;
 
         yg->init(buffering, command);
-        buffering->go();
+        buffering->go(process_handle);
 
         failed = false;
     }
@@ -491,6 +546,159 @@ private:
 }
 
 //------------------------------------------------------------------------------
+/// -name:  io.open
+/// -ver:   0.0.1
+/// -arg:   filename:string
+/// -arg:   [mode:string]
+/// -ret:   file
+/// This function opens a file named by <span class="arg">filename</span>, in
+/// the mode specified in the string <span class="arg">mode</span>.  It returns
+/// a new file handle, or, in case of errors, nil plus an error message and
+/// error number.
+///
+/// The <span class="arg">mode</span> string can be any of the following:
+/// <ul>
+/// <li><code>"r"</code>: read mode (the default);
+/// <li><code>"w"</code>: write mode;
+/// <li><code>"wx"</code>: write mode, but fail if the file already exists (requires v1.3.18 or higher);
+/// <li><code>"a"</code>: append mode;
+/// <li><code>"r+"</code>: update mode, all previous data is preserved;
+/// <li><code>"w+"</code>: update mode, all previous data is erased;
+/// <li><code>"w+x"</code>: update mode, all previous data is erased, but fail if the file already exists (requires v1.3.18 or higher);
+/// <li><code>"a+"</code>: append update mode, previous data is preserved, writing is only allowed at the end of file.
+/// </ul>
+///
+/// The <span class="arg">mode</span> string can also have a <code>'b'</code> at
+/// the end to open the file in binary mode.
+///
+/// The <code>'x'</code> modes are Clink extensions to Lua.
+
+//------------------------------------------------------------------------------
+static int io_sclose(lua_State* state)
+{
+    luaL_Stream* p = ((luaL_Stream*)luaL_checkudata(state, 1, LUA_FILEHANDLE));
+    int res = fclose(p->f);
+    return luaL_fileresult(state, (res == 0), NULL);
+}
+
+//------------------------------------------------------------------------------
+/// -name:  io.sopen
+/// -ver:   1.3.18
+/// -arg:   filename:string
+/// -arg:   [mode:string]
+/// -arg:   [deny:string]
+/// -ret:   file
+/// This is the same as <a href="#io.open">io.open()</a>, but adds an optional
+/// <code>deny</code> argument that specifies the type of sharing allowed.
+///
+/// This function opens a file named by <span class="arg">filename</span>, in
+/// the mode specified in the string <span class="arg">mode</span>.  It returns
+/// a new file handle, or, in case of errors, nil plus an error message and
+/// error number.
+///
+/// The <span class="arg">mode</span> string can be any of the following:
+/// <ul>
+/// <li><code>"r"</code>: read mode (the default);
+/// <li><code>"w"</code>: write mode;
+/// <li><code>"wx"</code>: write mode, but fail if the file already exists;
+/// <li><code>"a"</code>: append mode;
+/// <li><code>"r+"</code>: update mode, all previous data is preserved;
+/// <li><code>"w+"</code>: update mode, all previous data is erased;
+/// <li><code>"w+x"</code>: update mode, all previous data is erased, but fail if the file already exists;
+/// <li><code>"a+"</code>: append update mode, previous data is preserved, writing is only allowed at the end of file.
+/// </ul>
+///
+/// The <span class="arg">mode</span> string can also have a <code>'b'</code> at
+/// the end to open the file in binary mode.
+///
+/// The <span class="arg">deny</span> string can be any of the following:
+/// <ul>
+/// <li><code>"r"</code> denies read access;
+/// <li><code>"w"</code> denies write access;
+/// <li><code>"rw"</code> denies read and write access;
+/// <li><code>""</code> permits read and write access (the default).
+/// </ul>
+static int io_sopen(lua_State* state)
+{
+    const char* filename = luaL_checkstring(state, 1);
+    const char* mode = luaL_optstring(state, 2, "r");
+    const char* deny = luaL_optstring(state, 3, "");
+
+    luaL_Stream* p = (luaL_Stream*)lua_newuserdata(state, sizeof(luaL_Stream));
+    luaL_setmetatable(state, LUA_FILEHANDLE);
+    p->f = NULL;
+    p->closef = &io_sclose;
+
+    const char *md = mode; /* to traverse/check mode */
+    luaL_argcheck(state, lua_checkmode(md), 2, "invalid mode");
+
+    int share = 0;
+    if (!deny[0])
+    {
+        share = _SH_DENYNO;
+    }
+    else if (deny[0] == 'r')
+    {
+        if (!deny[1])
+            share = _SH_DENYRD;
+        else if (deny[1] == 'w' && !deny[2])
+            share = _SH_DENYRW;
+    }
+    else if (deny[0] == 'w')
+    {
+        if (!deny[1])
+            share = _SH_DENYWR;
+        else if (deny[1] == 'r' && !deny[2])
+            share = _SH_DENYRW;
+    }
+    luaL_argcheck(state, (share != 0), 3, "invalid deny");
+
+    p->f = _fsopen(filename, mode, share);
+    return (p->f == NULL) ? luaL_fileresult(state, 0, filename) : 1;
+}
+
+//------------------------------------------------------------------------------
+/// -name:  io.truncate
+/// -ver:   1.3.41
+/// -arg:   file:file
+/// -ret:   integer
+/// This function truncates the <span class="arg">file</span> previously opened
+/// by <code>io.open</code> or <code>io.sopen</code>.  When used on a pipe or
+/// other file handle that doesn't refer to an actual file, the behavior is
+/// undefined.
+///
+/// If successful, the return value is the position at which the file was
+/// truncated.  If an error occurs, the return values are nil, an error message,
+/// and an error code.
+static int io_truncate(lua_State* state)
+{
+    luaL_Stream* file = ((luaL_Stream *)luaL_checkudata(state, 1, LUA_FILEHANDLE));
+    assert(file);
+    if (!file)
+        return 0;
+
+    int stat = fflush(file->f);
+    if (stat)
+    {
+failed:
+        return luaL_fileresult(state, false, NULL);
+    }
+
+    int fd = _fileno(file->f);
+    HANDLE h = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
+
+    LARGE_INTEGER liSize;
+    LARGE_INTEGER liZero = {};
+    if (!SetFilePointerEx(h, liZero, &liSize, FILE_CURRENT))
+        goto failed;
+
+    if (_chsize_s(fd, liSize.QuadPart))
+        goto failed;
+
+    return luaL_fileresult(state, true, NULL);
+}
+
+//------------------------------------------------------------------------------
 void io_lua_initialise(lua_state& lua)
 {
     struct {
@@ -499,6 +707,8 @@ void io_lua_initialise(lua_state& lua)
     } methods[] = {
         { "popenrw",                    &io_popenrw },
         { "popenyield_internal",        &io_popenyield },
+        { "sopen",                      &io_sopen },
+        { "truncate",                   &io_truncate },
     };
 
     lua_State* state = lua.get_state();

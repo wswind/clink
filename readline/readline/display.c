@@ -94,8 +94,10 @@ static void _rl_move_cursor_relative PARAMS((int, const char *, const char *));
 /* begin_clink_change */
 //static char *expand_prompt PARAMS((char *, int, int *, int *, int *, int *));
 static char *expand_prompt PARAMS((const char *, int, int *, int *, int *, int *));
+#define line_state __rl_line_state__ /* Disambiguate to help debuggers. */
 /* end_clink_change */
 
+#if !defined (OMIT_DEFAULT_DISPLAY_READLINE)
 #define DEFAULT_LINE_BUFFER_SIZE	1024
 
 /* State of visible and invisible lines. */
@@ -128,6 +130,10 @@ static int line_structures_initialized = 0;
 #define vis_face	(line_state_visible->lface)
 #define invisible_line	(line_state_invisible->line)
 #define inv_face	(line_state_invisible->lface)
+#else /* OMIT_DEFAULT_DISPLAY_READLINE */
+static int* const vis_lbreaks = NULL;
+static char* const visible_line = NULL;
+#endif /* OMIT_DEFAULT_DISPLAY_READLINE */
 
 #if defined (HANDLE_MULTIBYTE)
 static int _rl_col_width PARAMS((const char *, int, int, int));
@@ -181,12 +187,17 @@ static int _rl_col_width PARAMS((const char *, int, int, int));
    RL_DISPLAY_FIXED variable.  This is good for efficiency. */
 
 /* Application-specific redisplay function. */
+#if !defined (OMIT_DEFAULT_DISPLAY_READLINE)
 rl_voidfunc_t *rl_redisplay_function = rl_redisplay;
+#else
+rl_voidfunc_t *rl_redisplay_function = NULL;
+#endif
 
 /* begin_clink_change */
 /* Application-specific function to be called before displaying the
    input line. */
 rl_voidfunc_t *rl_before_display_function = (rl_voidfunc_t *)NULL;
+extern void host_on_new_line();
 /* end_clink_change */
 
 /* begin_clink_change */
@@ -425,6 +436,7 @@ expand_prompt (const char *pmt, int flags, int *lp, int *lip, int *niflp, int *v
 
 /* begin_clink_change */
   can_add_invis = 0;
+  newlines = 0;
 /* end_clink_change */
   mb_cur_max = MB_CUR_MAX;
 
@@ -649,7 +661,7 @@ rl_set_rprompt (const char *rprompt)
 
   if (rprompt && *rprompt)
     {
-      rl_rprompt = expand_prompt (rprompt, 0, (int *)NULL, (int *)NULL, (int *)NULL, &rl_visible_rprompt_length);
+      rl_rprompt = expand_prompt (rprompt, PMT_RPROMPT, (int *)NULL, (int *)NULL, (int *)NULL, &rl_visible_rprompt_length);
     }
   else
     {
@@ -660,7 +672,7 @@ rl_set_rprompt (const char *rprompt)
   return 0;
 }
 
-static void
+void
 tputs_rprompt (const char *s)
 {
   int col = _rl_screenwidth - (s ? rl_visible_rprompt_length : _rl_rprompt_shown_len);
@@ -794,8 +806,27 @@ rl_get_local_prompt_prefix (void)
 {
   return local_prompt_prefix;
 }
+
+const char *
+rl_get_message_buffer (void)
+{
+  return msg_buf;
+}
+
+int
+rl_get_forced_display (void)
+{
+  return forced_display;
+}
+
+void
+rl_set_forced_display (int force)
+{
+  forced_display = force;
+}
 /* end_clink_change */
 
+#if !defined (OMIT_DEFAULT_DISPLAY_READLINE)
 /* Allocate the various line structures, making sure they can hold MINSIZE
    bytes. If the existing line size can accommodate MINSIZE bytes, don't do
    anything. */
@@ -904,6 +935,12 @@ set_active_region (int *beg, int *end)
       *end = (rl_mark < rl_point) ? rl_point : rl_mark;
     }
 }
+#else /* OMIT_DEFAULT_DISPLAY_READLINE */
+static void
+init_line_structures (int minsize)
+{
+}
+#endif /* OMIT_DEFAULT_DISPLAY_READLINE */
 
 /* Do whatever tests are necessary and tell update_line that it can do a
    quick, dumb redisplay on the assumption that there are so many
@@ -919,6 +956,7 @@ _rl_optimize_redisplay (void)
     _rl_quick_redisplay = 1;
 }  
 
+#if !defined (OMIT_DEFAULT_DISPLAY_READLINE)
 /* Basic redisplay algorithm.  See comments inline. */
 void
 rl_redisplay (void)
@@ -1810,6 +1848,7 @@ rl_redisplay (void)
   RL_UNSETSTATE (RL_STATE_REDISPLAYING);
   _rl_release_sigint ();
 }
+#endif /* OMIT_DEFAULT_DISPLAY_READLINE */
 
 /* begin_clink_change */
 int
@@ -1867,6 +1906,7 @@ norm_face (char *face, int n)
 
 #define ADJUST_CPOS(x) do { _rl_last_c_pos -= (x) ; cpos_adjusted = 1; } while (0)
 
+#if !defined (OMIT_DEFAULT_DISPLAY_READLINE)
 /* PWP: update_line() is based on finding the middle difference of each
    line on the screen; vis:
 
@@ -2806,11 +2846,16 @@ clear_rest_of_line:
 	}
     }
 }
+#endif /* OMIT_DEFAULT_DISPLAY_READLINE */
 
 /* Tell the update routines that we have moved onto a new (empty) line. */
 int
 rl_on_new_line (void)
 {
+/* begin_clink_change */
+  host_on_new_line();
+/* end_clink_change */
+
   if (visible_line)
     visible_line[0] = '\0';
 
@@ -2862,6 +2907,10 @@ rl_on_new_line_with_prompt (void)
   int prompt_size, i, l, real_screenwidth, newlines;
   char *prompt_last_line, *lprompt;
 
+/* begin_clink_change */
+  host_on_new_line();
+/* end_clink_change */
+
   /* Initialize visible_line and invisible_line to ensure that they can hold
      the already-displayed prompt. */
   prompt_size = strlen (rl_prompt) + 1;
@@ -2870,8 +2919,10 @@ rl_on_new_line_with_prompt (void)
   /* Make sure the line structures hold the already-displayed prompt for
      redisplay. */
   lprompt = local_prompt ? local_prompt : rl_prompt;
+#if !defined (OMIT_DEFAULT_DISPLAY_READLINE)
   strcpy (visible_line, lprompt);
   strcpy (invisible_line, lprompt);
+#endif
 
   /* If the prompt contains newlines, take the last tail. */
   prompt_last_line = strrchr (rl_prompt, '\n');
@@ -2896,6 +2947,7 @@ rl_on_new_line_with_prompt (void)
     _rl_output_some_chars ("\n", 1);
   last_lmargin = 0;
 
+#if !defined (OMIT_DEFAULT_DISPLAY_READLINE)
   newlines = 0; i = 0;
   while (i <= l)
     {
@@ -2905,6 +2957,7 @@ rl_on_new_line_with_prompt (void)
     }
   vis_lbreaks[newlines] = l;
   visible_wrap_offset = 0;
+#endif
 
   rl_display_prompt = rl_prompt;	/* XXX - make sure it's set */
 
@@ -2942,6 +2995,7 @@ rl_redraw_prompt_last_line (void)
     rl_forced_update_display ();
 }
 
+#if !defined (OMIT_DEFAULT_DISPLAY_READLINE)
 /* Move the cursor from _rl_last_c_pos to NEW, which are buffer indices.
    (Well, when we don't have multibyte characters, _rl_last_c_pos is a
    buffer index.)
@@ -3097,6 +3151,7 @@ _rl_move_cursor_relative (int new, const char *data, const char *dataf)
 
   _rl_last_c_pos = dpos;
 }
+#endif /* OMIT_DEFAULT_DISPLAY_READLINE */
 
 /* PWP: move the cursor up or down. */
 void
@@ -3379,6 +3434,10 @@ _rl_make_prompt_for_search (int pchar)
 {
   int len;
   char *pmt, *p;
+/* begin_clink_change */
+  const char* color;
+  int extra;
+/* end_clink_change */
 
   rl_save_prompt ();
 
@@ -3389,28 +3448,58 @@ _rl_make_prompt_for_search (int pchar)
   if (p == 0)
     {
       len = (rl_prompt && *rl_prompt) ? strlen (rl_prompt) : 0;
-      pmt = (char *)xmalloc (len + 2);
-      if (len)
-	strcpy (pmt, rl_prompt);
-      pmt[len] = pchar;
-      pmt[len+1] = '\0';
+/* begin_clink_change */
+      // pmt = (char *)xmalloc (len + 2);
+      // if (len)
+	// strcpy (pmt, rl_prompt);
+      // pmt[len] = pchar;
+      // pmt[len+1] = '\0';
+/* end_clink_change */
     }
   else
     {
       p++;
       len = strlen (p);
-      pmt = (char *)xmalloc (len + 2);
+/* begin_clink_change */
+      // pmt = (char *)xmalloc (len + 2);
+      // if (len)
+	// strcpy (pmt, p);
+      // pmt[len] = pchar;
+      // pmt[len+1] = '\0';
+/* end_clink_change */
+    }  
+
+/* begin_clink_change */
+  color = (_rl_display_message_color && 
+           *_rl_display_message_color) ? _rl_display_message_color : _normal_color;
+  extra = color ? _normal_color_len + strlen(color) + _normal_color_len : 0;
+  pmt = (char *)xmalloc (len + extra + 2);
+  if (extra)
+    {
       if (len)
-	strcpy (pmt, p);
+        {
+          strcpy (pmt, _normal_color);
+          strcpy (pmt + _normal_color_len, p ? p : rl_prompt);
+        }
+      strcpy (pmt + _normal_color_len + len, color);
+      pmt[extra + len - _normal_color_len] = pchar;
+      strcpy (pmt + extra + len + 1 - _normal_color_len, _normal_color);
+    }
+  else
+    {
+      if (len)
+        strcpy (pmt, p ? p : rl_prompt);
       pmt[len] = pchar;
       pmt[len+1] = '\0';
-    }  
+    }
+/* end_clink_change */
 
   /* will be overwritten by expand_prompt, called from rl_message */
   prompt_physical_chars = saved_physical_chars + 1;
   return pmt;
 }
 
+#if !defined (OMIT_DEFAULT_DISPLAY_READLINE)
 /* Quick redisplay hack when erasing characters at the end of the line. */
 void
 _rl_erase_at_end_of_line (int l)
@@ -3425,6 +3514,7 @@ _rl_erase_at_end_of_line (int l)
     visible_line[--_rl_last_c_pos] = '\0';
   rl_display_fixed++;
 }
+#endif /* OMIT_DEFAULT_DISPLAY_READLINE */
 
 /* Clear to the end of the line.  COUNT is the minimum
    number of character spaces to clear, but we use a terminal escape
@@ -3567,12 +3657,13 @@ _rl_update_final (void)
 {
   int full_lines, woff, botline_length;
 
-  if (line_structures_initialized == 0)
-    return;
-
 /* begin_clink_change */
   end_prompt (-1/*crlf*/);
 /* end_clink_change */
+
+#if !defined (OMIT_DEFAULT_DISPLAY_READLINE)
+  if (line_structures_initialized == 0)
+    return;
 
   full_lines = 0;
   /* If the cursor is the only thing on an otherwise-blank last line,
@@ -3614,6 +3705,7 @@ _rl_update_final (void)
     rl_crlf ();
   fflush (rl_outstream);
   rl_display_fixed++;
+#endif /* OMIT_DEFAULT_DISPLAY_READLINE */
 }
 
 /* Move to the start of the current line. */
@@ -3650,6 +3742,9 @@ redraw_prompt (char *t)
   rl_restore_prompt();
 }
       
+/* begin_clink_change */
+#if 0
+/* end_clink_change */
 /* Redisplay the current line after a SIGWINCH is received. */
 void
 _rl_redisplay_after_sigwinch (void)
@@ -3695,6 +3790,9 @@ _rl_redisplay_after_sigwinch (void)
   else
     rl_forced_update_display ();
 }
+/* begin_clink_change */
+#endif
+/* end_clink_change */
 
 void
 _rl_clean_up_for_exit (void)
@@ -3729,6 +3827,7 @@ _rl_ttyflush (void)
   fflush (rl_outstream);
 }
 
+#if !defined (OMIT_DEFAULT_DISPLAY_READLINE)
 /* return the `current display line' of the cursor -- the number of lines to
    move up to get to the first screen line of the current readline line. */
 int
@@ -3750,6 +3849,7 @@ _rl_current_display_line (void)
 
   return ret;
 }
+#endif /* OMIT_DEFAULT_DISPLAY_READLINE */
 
 void
 _rl_refresh_line (void)

@@ -25,12 +25,17 @@
 !include "winmessages.nsh"
 !include "Sections.nsh"
 !include "FileFunc.nsh"
+!include "x64.nsh"
 
 ;-------------------------------------------------------------------------------
 Unicode                 true
 Name                    "clink v${CLINK_VERSION}"
-InstallDir              "$PROGRAMFILES\clink"
-InstallDirRegKey        HKLM "Software\Clink" "InstallDir"
+; InstallDir and InstallDirRegKey are omitted so that /D= usage can be detected.
+; The .onInit function handles providing a default value when /D= is omitted,
+; reading the InstallDir regkey when appropriate.  The "-" section handles
+; writing the InstallDir regkey.
+;InstallDir              "$PROGRAMFILES\clink"
+;InstallDirRegKey        HKLM "Software\Clink" "InstallDir"
 OutFile                 "${CLINK_BUILD}_setup.exe"
 AllowSkipFiles          off
 SetCompressor           /SOLID lzma
@@ -126,11 +131,16 @@ Section "!Application files" app_files_id
     CreateDirectory $INSTDIR
     SetOutPath $INSTDIR
     File ${CLINK_BUILD}\clink_dll_x*.dll
+    File ${CLINK_BUILD}\clink.ico
     File ${CLINK_BUILD}\CHANGES
     File ${CLINK_BUILD}\LICENSE
     File ${CLINK_BUILD}\clink_x*.exe
     File ${CLINK_BUILD}\clink.bat
     File ${CLINK_BUILD}\clink.html
+    ${If} ${IsNativeARM64}
+        File ${CLINK_BUILD}\clink_dll_arm*.dll
+        File ${CLINK_BUILD}\clink_arm*.exe
+    ${EndIf}
 
     ; Create an uninstaller.
     ;
@@ -178,7 +188,7 @@ Section "Add shortcuts to Start menu" section_add_shortcuts
 
     ; Add shortcuts to the program and documentation.
     ;
-    CreateShortcut "$0\Clink v${CLINK_VERSION}.lnk" "$INSTDIR\clink.bat" 'startmenu --profile ~\clink' "$SYSDIR\cmd.exe" 0 SW_SHOWMINIMIZED
+    CreateShortcut "$0\Clink v${CLINK_VERSION}.lnk" "$INSTDIR\clink.bat" 'startmenu --profile ~\clink' "$INSTDIR\clink.ico" 0 SW_SHOWMINIMIZED
     CreateShortcut "$0\Clink v${CLINK_VERSION} Documentation.lnk" "$INSTDIR\clink.html"
 
     ; Add a shortcut to the uninstaller.
@@ -206,6 +216,20 @@ Section "Autorun when cmd.exe starts" section_autorun
 SectionEnd
 
 ;-------------------------------------------------------------------------------
+Section "Install shortcut icons" section_icons
+    SetShellVarContext all
+
+    File /oname=clink_red.ico ${CLINK_BUILD}\clink_red.ico
+    File /oname=clink_orange.ico ${CLINK_BUILD}\clink_orange.ico
+    File /oname=clink_gold.ico ${CLINK_BUILD}\clink_gold.ico
+    File /oname=clink_green.ico ${CLINK_BUILD}\clink_green.ico
+    File /oname=clink_cyan.ico ${CLINK_BUILD}\clink_cyan.ico
+    File /oname=clink_blue.ico ${CLINK_BUILD}\clink_blue.ico
+    File /oname=clink_purple.ico ${CLINK_BUILD}\clink_purple.ico
+    File /oname=clink_gray.ico ${CLINK_BUILD}\clink_gray.ico
+SectionEnd
+
+;-------------------------------------------------------------------------------
 Section "-"
     ; Remember the installation directory.
     WriteRegStr HKLM Software\Clink InstallDir $INSTDIR
@@ -225,6 +249,11 @@ Section "-"
     IntOp $0 $0 & ${SF_SELECTED}
     WriteRegDWORD HKLM Software\Clink UseAutoRun $0
 
+    ; Remember the icons choice.
+    SectionGetFlags ${section_icons} $0
+    IntOp $0 $0 & ${SF_SELECTED}
+    WriteRegDWORD HKLM Software\Clink ShortcutIcons $0
+
     ; Remember the CLINK_DIR choice.
     SectionGetFlags ${section_clink_dir} $0
     IntOp $0 $0 & ${SF_SELECTED}
@@ -233,19 +262,25 @@ SectionEnd
 
 ;-------------------------------------------------------------------------------
 Function .onInit
-    ; Check command line options.
     ${GetParameters} $1
+
+    ; Check command line options.
     ClearErrors
     ${GetOptions} $1 '/?' $0
+    IfErrors 0 +4
+    ClearErrors
+    ${GetOptions} $1 '-?' $0
     IfErrors +3 0
-        MessageBox MB_OK "/?\tShow this help.\n/noEnhance\tUncheck 'Use enhanced default settings'."
+        MessageBox MB_OK "/?$\t$\tShow this help.$\n/noEnhance$\tUncheck 'Use enhanced default settings'.$\n/S$\t$\tSilently install.$\n/D=dir$\t$\tInstallation directory.$\n$\nIf /D=dir is used, it must come last in the command line, it must not use quotes, and dir must be an absolute path."
         Abort
 
-    ; Apply remembered installation directory.
-    ReadRegStr $0 HKLM Software\Clink InstallDir
-    StrCmp $0 "" LEmptyInstallDir 0
-        StrCpy $INSTDIR $0
-    LEmptyInstallDir:
+    ; Apply remembered installation directory, unless /D is used.
+    StrCmp $INSTDIR "" 0 LInstallDir
+        StrCpy $INSTDIR "$PROGRAMFILES\clink"
+        ReadRegStr $0 HKLM Software\Clink InstallDir
+        StrCmp $0 "" LInstallDir 0
+            StrCpy $INSTDIR $0
+    LInstallDir:
 
     ; Apply remembered selection state for enhanced default settings section.
     SectionSetFlags ${section_enhance} 0
@@ -269,6 +304,12 @@ Function .onInit
     StrCmp $0 "0" 0 LUseAutoRun
         SectionSetFlags ${section_autorun} 0
     LUseAutoRun:
+
+    ; Apply remembered selection state for icons section.
+    ReadRegDWORD $0 HKLM Software\Clink ShortcutIcons
+    StrCmp $0 "0" 0 LShortcutIcons
+        SectionSetFlags ${section_icons} 0
+    LShortcutIcons:
 
     ; Apply remembered selection state for CLINK_DIR section.
     ReadRegDWORD $0 HKLM Software\Clink SetClinkDir
@@ -319,6 +360,7 @@ LangString desc_enhanced_defaults   ${LANG_ENGLISH} "Pre-configures Clink with s
 LangString desc_add_shortcuts       ${LANG_ENGLISH} "Adds Start Menu shortcuts for Clink and its documentation."
 LangString desc_clink_dir           ${LANG_ENGLISH} "Sets %CLINK_DIR% to the Clink install location."
 LangString desc_autorun             ${LANG_ENGLISH} "Configures the CMD.EXE AutoRun regkey to inject Clink when CMD.EXE starts.  This can be convenient, but also makes starting CMD.EXE always a little slower."
+LangString desc_icons               ${LANG_ENGLISH} "Installs Clink icon files for use in shortcuts, terminal tabs, etc."
 
 LangString undesc_app_files         ${LANG_ENGLISH} "Removes the Clink application files."
 LangString undesc_scripts           ${LANG_ENGLISH} "Removes the default Clink profile directory for the current user."
@@ -329,6 +371,7 @@ LangString undesc_scripts           ${LANG_ENGLISH} "Removes the default Clink p
     !insertmacro MUI_DESCRIPTION_TEXT ${section_add_shortcuts} $(desc_add_shortcuts)
     !insertmacro MUI_DESCRIPTION_TEXT ${section_clink_dir} $(desc_clink_dir)
     !insertmacro MUI_DESCRIPTION_TEXT ${section_autorun} $(desc_autorun)
+    !insertmacro MUI_DESCRIPTION_TEXT ${section_icons} $(desc_icons)
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
 
 !insertmacro MUI_UNFUNCTION_DESCRIPTION_BEGIN

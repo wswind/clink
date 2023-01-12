@@ -21,7 +21,8 @@ struct yield_thread : public std::enable_shared_from_this<yield_thread>
     void            cancel();
 
     bool            is_ready();
-    HANDLE          get_ready_event();
+    virtual HANDLE  get_ready_event();
+    virtual void    set_need_completion();
 
     void            wait(unsigned int timeout);
 
@@ -33,17 +34,16 @@ protected:
 
 private:
     virtual void    do_work() = 0;
+    virtual bool    do_completion() { return false; }
 
     static unsigned __stdcall threadproc(void* arg);
 
     HANDLE m_thread_handle = 0;
     HANDLE m_ready_event = 0;
-    HANDLE m_wake_event = 0;
     str_moveable m_cwd;
     bool m_suspended = false;
 
     volatile long m_cancelled = false;
-    volatile long m_ready = false;
 
     std::shared_ptr<yield_thread> m_holder;
 };
@@ -56,11 +56,13 @@ struct luaL_YieldGuard
     void init(std::shared_ptr<yield_thread> thread, const char* command);
 
 protected:
+    ~luaL_YieldGuard() = default;
     const char* get_command() const;
 
 private:
     static int ready(lua_State* state);
     static int command(lua_State* state);
+    static int set_need_completion(lua_State* state);
     static int results(lua_State* state);
     static int wait(lua_State* state);
     static int __gc(lua_State* state);

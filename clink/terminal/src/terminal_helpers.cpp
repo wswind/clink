@@ -176,10 +176,10 @@ static bool s_mouse_shift = false;
 static bool s_quick_edit = false;
 
 //------------------------------------------------------------------------------
-static DWORD select_mouse_input(DWORD mode)
+DWORD select_mouse_input(DWORD mode)
 {
     if (!g_accept_mouse_input)
-        return 0;
+        return mode & ~ENABLE_MOUSE_INPUT;
 
     switch (g_mouse_input.get())
     {
@@ -210,6 +210,9 @@ static DWORD select_mouse_input(DWORD mode)
         default:
             if (s_mouse_alt || s_mouse_ctrl || s_mouse_shift)
                 mode |= ENABLE_MOUSE_INPUT;
+            else if (get_native_ansi_handler() == ansi_handler::winterminal ||
+                     get_native_ansi_handler() == ansi_handler::wezterm)
+                mode &= ~ENABLE_MOUSE_INPUT;
             else if (!(mode & ENABLE_QUICK_EDIT_MODE))
                 mode |= ENABLE_MOUSE_INPUT;
             break;
@@ -275,22 +278,39 @@ void console_config::fix_quick_edit_mode(DWORD& mode)
     if (!g_accept_mouse_input)
         return;
 
-    if (get_native_ansi_handler() == ansi_handler::conemu)
-        return;
+    switch (get_native_ansi_handler())
+    {
+    case ansi_handler::conemu:
+        break;
 
-    if (s_mouse_alt || s_mouse_ctrl || s_mouse_shift)
-    {
-        if (is_mouse_modifier() || (!s_quick_edit && no_mouse_modifiers()))
+    case ansi_handler::winterminal:
+    case ansi_handler::wezterm:
+        if ((s_mouse_alt || s_mouse_ctrl || s_mouse_shift) && is_mouse_modifier())
+        {
             mode &= ~ENABLE_QUICK_EDIT_MODE;
+        }
         else
+        {
             mode |= ENABLE_QUICK_EDIT_MODE;
-    }
-    else
-    {
-        if (is_mouse_modifier())
-            mode &= ~ENABLE_QUICK_EDIT_MODE;
+        }
+        break;
+
+    default:
+        if (s_mouse_alt || s_mouse_ctrl || s_mouse_shift)
+        {
+            if (is_mouse_modifier() || (!s_quick_edit && no_mouse_modifiers()))
+                mode &= ~ENABLE_QUICK_EDIT_MODE;
+            else
+                mode |= ENABLE_QUICK_EDIT_MODE;
+        }
         else
-            mode |= ENABLE_QUICK_EDIT_MODE;
+        {
+            if (is_mouse_modifier())
+                mode &= ~ENABLE_QUICK_EDIT_MODE;
+            else
+                mode |= ENABLE_QUICK_EDIT_MODE;
+        }
+        break;
     }
 }
 

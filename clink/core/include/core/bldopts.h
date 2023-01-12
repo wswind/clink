@@ -1,4 +1,4 @@
-// Copyright (c) 2022 Christopher Antos
+﻿// Copyright (c) 2022 Christopher Antos
 // License: http://opensource.org/licenses/MIT
 
 #pragma once
@@ -33,3 +33,12 @@
 //#define DEBUG_RESOLVEIMPL
 //#define USE_OS_UTF_CONVERSION
 #endif
+
+//------------------------------------------------------------------------------
+// Define this to add callstacks with `debug.log_terminal`.
+//#define LOG_OUTPUT_CALLSTACKS
+
+//------------------------------------------------------------------------------
+// Clink doesn't support rl_byte_oriented mode.  Defining it to 0 lets the
+// compiler optimize away any code specific to that mode.
+#define rl_byte_oriented    (0)

@@ -22,7 +22,6 @@ struct match_info
     char            suppress_append;    // Negative means not specified.
     bool            append_display;
     bool            select;
-    bool            infer_type;
 };
 
 //------------------------------------------------------------------------------
@@ -79,10 +78,12 @@ public:
     virtual int             get_suppress_quoting() const override;
     virtual int             get_word_break_position() const override;
     virtual bool            match_display_filter(const char* needle, char** matches, match_display_filter_entry*** filtered_matches, display_filter_flags flags, bool* old_filtering=nullptr) const override;
+    virtual bool            filter_matches(char** matches, char completion_type, bool filename_completion_desired) const override;
 
     void                    set_word_break_position(int position);
     void                    set_regen_blocked();
     bool                    is_regen_blocked() const { return m_regen_blocked; }
+    bool                    is_volatile() const { return m_volatile; }
 
     void                    set_generator(match_generator* generator);
     void                    done_building();
@@ -108,6 +109,7 @@ private:
     void                    set_deprecated_mode();
     void                    set_matches_are_files(bool files);
     void                    set_no_sort();
+    void                    set_volatile();
     bool                    add_match(const match_desc& desc, bool already_normalised=false);
     unsigned int            get_info_count() const;
     const match_info*       get_infos() const;
@@ -130,13 +132,14 @@ private:
     store_impl              m_store;
     infos                   m_infos;
     unsigned short          m_count = 0;
-    bool                    m_any_infer_type = false;
-    bool                    m_can_infer_type = true;
+    bool                    m_any_none_type = false;
+    bool                    m_deprecated_mode = false;
     bool                    m_coalesced = false;
     char                    m_append_character = '\0';
     bool                    m_suppress_append = false;
     bool                    m_regen_blocked = false;
     bool                    m_nosort = false;
+    bool                    m_volatile = false;
     int                     m_suppress_quoting = 0;
     int                     m_word_break_position = -1;
     shadow_bool             m_filename_completion_desired;

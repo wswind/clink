@@ -19,7 +19,6 @@
 #include <lib/matches_lookaside.h>
 #include <lib/popup.h>
 #include <lib/display_matches.h>
-#include <terminal/ecma48_iter.h>
 
 extern "C" {
 #include <lua.h>
@@ -89,55 +88,22 @@ void lua_match_generator::get_word_break_info(const line_state& line, word_break
 
     os::cwd_restorer cwd;
 
+    // The getword() and getendword() functions cannot safely strip quotes
+    // during getwordbreakinfo() because it requires exact literal offsets
+    // into the input line buffer.
+    line_state::set_can_strip_quotes(false);
+
     if (m_state.pcall(state, 1, 2) != 0)
     {
+        line_state::set_can_strip_quotes(true);
         info.clear();
         return;
     }
 
+    line_state::set_can_strip_quotes(true);
+
     info.truncate = int(lua_tointeger(state, -2));
     info.keep = int(lua_tointeger(state, -1));
-}
-
-//------------------------------------------------------------------------------
-// Parse ANSI escape codes to determine the visible character length of the
-// string (which gets used for column alignment).  When a strip out parameter is
-// supplied, this also strips ANSI escape codes and the strip out parameter
-// receives a pointer to the next character past the nul terminator.
-static int plainify(const char* s, char** strip)
-{
-    int visible_len = 0;
-
-    // TODO:  This does not handle BEL, OSC title codes, or envvar substitution.
-    // Use ecma48_processor() if that becomes necessary, but then s cannot be
-    // in/out since envvar substitutions could make the output string be longer
-    // than the input string.
-
-    ecma48_state state;
-    ecma48_iter iter(s, state);
-    char* plain = const_cast<char *>(s);
-    while (const ecma48_code& code = iter.next())
-        if (code.get_type() == ecma48_code::type_chars)
-        {
-            str_iter inner_iter(code.get_pointer(), code.get_length());
-            while (int c = inner_iter.next())
-                visible_len += clink_wcwidth(c);
-
-            if (strip)
-            {
-                const char *ptr = code.get_pointer();
-                for (int i = code.get_length(); i--;)
-                    *(plain++) = *(ptr++);
-            }
-        }
-
-    if (strip)
-    {
-        *(plain++) = '\0';
-        *strip = plain;
-    }
-
-    return visible_len;
 }
 
 //------------------------------------------------------------------------------
@@ -217,7 +183,7 @@ done:
     const int needle_len = int(strlen(needle));
 
     // Count matches.
-    const bool only_lcd = matches[0] && !matches[1];
+    const bool only_lcd = matches[0] && *matches[0] && !matches[1];
     int match_count = only_lcd ? 1 : 0;
     for (i = 1; matches[i]; ++i, ++match_count);
 
@@ -393,10 +359,8 @@ done:
                         lcd.truncate(matching);
                 }
 
-                size_t alloc_size = sizeof(match_display_filter_entry) + 2;
-                if (match) alloc_size += strlen(match);
-                if (display) alloc_size += strlen(display);
-                if (description) alloc_size += strlen(description);
+                const size_t packed_size = calc_packed_size(match, display, description);
+                const size_t alloc_size = sizeof(match_display_filter_entry) - 1 + packed_size;
 
                 match_display_filter_entry *new_match;
                 new_match = (match_display_filter_entry *)malloc(alloc_size);
@@ -410,40 +374,15 @@ done:
                 j++;
 
                 // Fill in buffer with PACKED MATCH FORMAT.
-                new_match->match = append_string_into_buffer(buffer, match);
-                if (match && !new_match->match[0])
+                if (!display[0] || !pack_match(buffer, packed_size, match, type, display, description, append_char, flags, new_match, strip_markup))
                 {
-discard:
                     free(new_match);
                     j--;
                     break;
                 }
 
-                if (!display[0])
-                    goto discard;
-                *(buffer++) = (char)type;   // match type
-                *(buffer++) = append_char;  // append char
-                *(buffer++) = flags;        // match flags
-                new_match->display = append_string_into_buffer(buffer, display);
-                new_match->visible_display = plainify(new_match->display, strip_markup ? &buffer : nullptr);
-                if (new_match->visible_display <= 0)
-                    goto discard;
-
                 if (description)
-                {
                     one_column = true;
-                    new_match->description = append_string_into_buffer(buffer, description);
-                    new_match->visible_description = plainify(new_match->description, strip_markup ? &buffer : nullptr);
-                }
-                else
-                {
-                    // Must append empty string even when no description,
-                    // because do_popup_list expects 3 nul terminated strings.
-                    // Leave new_match->description nullptr to signal there is
-                    // no description (subtly different than having an empty
-                    // description).
-                    append_string_into_buffer(buffer, description);
-                }
 
                 if (max_visible_display < new_match->visible_display)
                     max_visible_display = new_match->visible_display;
@@ -467,15 +406,16 @@ next:
     //  - visible_description can be 0 when visible_display is negative; this
     //    means there are descriptions (use one column) but they are all blank.
     {
-        new_matches[0] = (match_display_filter_entry*)malloc(sizeof(match_display_filter_entry) + lcd.length() + 2);
+        const size_t packed_size = calc_packed_size(lcd.c_str(), "", nullptr);
+        new_matches[0] = (match_display_filter_entry*)malloc(sizeof(match_display_filter_entry) - 1 + packed_size);
         memset(new_matches[0], 0, sizeof(*new_matches[0]));
-        char* buffer = new_matches[0]->buffer;
-        new_matches[0]->match = append_string_into_buffer(buffer, lcd.c_str());
-        *(buffer++) = 0;    // match type
-        *(buffer++) = 0;    // append char
-        *(buffer++) = 0;    // match flags
-        new_matches[0]->display = append_string_into_buffer(buffer, nullptr);
-        append_string_into_buffer(buffer, nullptr); // Be consistent and add empty description field even in the lcd entry.
+#ifdef DEBUG
+        const bool packed =
+#endif
+        pack_match(new_matches[0]->buffer, packed_size, lcd.c_str(), match_type::none, nullptr, nullptr, 0, 0, new_matches[0], false, true/*lcd*/);
+#ifdef DEBUG
+        assert(packed); // pack_match guarantees success for the lcd case.
+#endif
 
         if (one_column)
             new_matches[0]->visible_display = 0 - max_visible_display;
@@ -528,7 +468,7 @@ next:
 }
 
 //------------------------------------------------------------------------------
-void lua_match_generator::filter_matches(char** matches, char completion_type, bool filename_completion_desired)
+bool lua_match_generator::filter_matches(char** matches, char completion_type, bool filename_completion_desired)
 {
     lua_State* state = m_state.get_state();
     save_stack_top ss(state);
@@ -542,25 +482,30 @@ void lua_match_generator::filter_matches(char** matches, char completion_type, b
     lua_pushliteral(state, "onfiltermatches");
 
     if (m_state.pcall(1, 1) != 0)
-        return;
+        return false;
 
     bool onfiltermatches = (!lua_isnil(state, -1) && lua_toboolean(state, -1) != false);
     if (!onfiltermatches)
-        return;
+        return false;
+
+    // If the caller just wants to know whether onfiltermatches is active, then
+    // short circuit.
+    if (!matches)
+        return true;
 
     // Count matches; bail if 0.
     const bool only_lcd = matches[0] && !matches[1];
     int match_count = only_lcd ? 1 : 0;
     for (int i = 1; matches[i]; ++i, ++match_count);
     if (match_count <= 0)
-        return;
+        return false;
 
     // Get ready to call the filter function.
     lua_getglobal(state, "clink");
     lua_pushliteral(state, "_send_onfiltermatches_event");
     lua_rawget(state, -2);
     if (lua_isnil(state, -1))
-        return;
+        return false;
 
     // Convert matches to a Lua table (arg 1).
     str<> tmp;
@@ -594,11 +539,11 @@ void lua_match_generator::filter_matches(char** matches, char completion_type, b
 
     // Call the filter.
     if (m_state.pcall(3, 1) != 0)
-        return;
+        return false;
 
     // If nil is returned then no filtering occurred.
     if (lua_isnil(state, -1))
-        return;
+        return false;
 
     // Hash the filtered matches to be kept.
     str_unordered_set keep_typeless;
@@ -642,8 +587,8 @@ void lua_match_generator::filter_matches(char** matches, char completion_type, b
 
     // Discard other matches.
     bool discarded = false;
-    char** read = &matches[1];
-    char** write = &matches[1];
+    char** read = &matches[!only_lcd];
+    char** write = &matches[!only_lcd];
     while (*read)
     {
         if (keep_typeless.find(*read) == keep_typeless.end())
@@ -662,7 +607,7 @@ void lua_match_generator::filter_matches(char** matches, char completion_type, b
     *write = nullptr;
 
     if (!discarded)
-        return;
+        return false;
 
     extern void reset_generate_matches();
     reset_generate_matches();
@@ -673,4 +618,6 @@ void lua_match_generator::filter_matches(char** matches, char completion_type, b
         free(matches[0]);
         matches[0] = nullptr;
     }
+
+    return true;
 }

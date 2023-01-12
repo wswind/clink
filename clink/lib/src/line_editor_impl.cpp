@@ -12,6 +12,7 @@
 #include "reclassify.h"
 #include "cmd_tokenisers.h"
 #include "doskey.h"
+#include "display_readline.h"
 
 #include <core/base.h>
 #include <core/os.h>
@@ -27,15 +28,18 @@ extern "C" {
 #include <compat/config.h>
 #include <readline/readline.h>
 #include <readline/rlprivate.h>
+#include <readline/rldefs.h>
+#include <readline/history.h>
 }
 
 //------------------------------------------------------------------------------
 extern setting_bool g_classify_words;
 extern setting_bool g_autosuggest_async;
+extern setting_bool g_history_autoexpand;
+extern setting_color g_color_histexpand;
 extern int g_suggestion_offset;
 
 extern "C" void host_clear_suggestion();
-extern void reset_suggester();
 extern bool check_recognizer_refresh();
 extern bool is_showing_argmatchers();
 extern bool win_fn_callback_pending();
@@ -50,6 +54,34 @@ extern std::shared_ptr<match_builder_toolkit> get_deferred_matches(int generatio
 inline char get_closing_quote(const char* quote_pair)
 {
     return quote_pair[1] ? quote_pair[1] : quote_pair[0];
+}
+
+//------------------------------------------------------------------------------
+static bool rl_vi_insert_mode_esc_special_case(int key)
+{
+    // This mirrors the conditions in the #if defined (VI_MODE) block in
+    // _rl_dispatch_subseq() in readline.c.  This is so when `terminal.raw_esc`
+    // is set the timeout hack can work for ESC in vi insertion mode.
+
+    if (rl_editing_mode == vi_mode &&
+        key == ESC &&
+        _rl_keymap == vi_insertion_keymap &&
+        _rl_keymap[key].type == ISKMAP &&
+        (FUNCTION_TO_KEYMAP(_rl_keymap, key))[ANYOTHERKEY].type == ISFUNC)
+    {
+        if ((RL_ISSTATE(RL_STATE_INPUTPENDING|RL_STATE_MACROINPUT) == 0) &&
+            _rl_pushed_input_available() == 0 &&
+            _rl_input_queued(0) == 0)
+            return true;
+
+        if ((RL_ISSTATE (RL_STATE_INPUTPENDING) == 0) &&
+            (RL_ISSTATE (RL_STATE_MACROINPUT) && _rl_peek_macro_key() == 0) &&
+            _rl_pushed_input_available() == 0 &&
+            _rl_input_queued(0) == 0)
+            return true;
+    }
+
+    return false;
 }
 
 
@@ -130,15 +162,32 @@ void update_matches()
 }
 
 //------------------------------------------------------------------------------
-bool notify_matches_ready(int generation_id)
+bool notify_matches_ready(std::shared_ptr<match_builder_toolkit> toolkit, int generation_id)
 {
-    if (!s_editor)
+    if (!s_editor || !toolkit)
         return false;
 
-    auto toolkit = get_deferred_matches(generation_id);
-    matches* matches = toolkit ? toolkit->get_matches() : nullptr;
+    matches* matches = toolkit->get_matches();
     return s_editor->notify_matches_ready(generation_id, matches);
 }
+
+//------------------------------------------------------------------------------
+void override_line_state(const char* line, const char* needle, int point)
+{
+    assert(s_editor);
+    if (!s_editor)
+        return;
+
+    s_editor->override_line(line, needle, point);
+}
+
+//------------------------------------------------------------------------------
+#ifdef DEBUG
+bool is_line_state_overridden()
+{
+    return s_editor && s_editor->is_line_overridden();
+}
+#endif
 
 //------------------------------------------------------------------------------
 void set_prompt(const char* prompt, const char* rprompt, bool redisplay)
@@ -149,25 +198,41 @@ void set_prompt(const char* prompt, const char* rprompt, bool redisplay)
     s_editor->set_prompt(prompt, rprompt, redisplay);
 }
 
-
-
 //------------------------------------------------------------------------------
-int host_add_history(int, const char* line)
+static void classify_history_expansions(const line_buffer& buffer, word_classifications& classifications)
 {
-    if (!s_callbacks)
-        return 0;
+    history_expansion* list = nullptr;
+    const char* color = g_color_histexpand.get();
+    if (color && *color && g_history_autoexpand.get())
+    {
+        // Counteract auto-suggestion, but restore it afterwards.
+        char* p = const_cast<char*>(buffer.get_buffer());
+        rollback<char> rb(p[buffer.get_length()], '\0');
 
-    return s_callbacks->add_history(line);
+        {
+            // The history expansion library can have side effects on the global
+            // history variables.  Must save and restore them.
+            save_history_expansion_state();
+            // Reset history offset, for consistency with history_db::expand().
+            // BUGBUG: neither of them should reset the history offset...!
+            using_history();
+            // Perform history expansion.
+            char* output = nullptr;
+            history_return_expansions = true;
+            history_expand(p, &output);
+            restore_history_expansion_state();
+        }
+
+        list = history_expansions;
+        history_expansions = nullptr;
+
+        for (const history_expansion* e = list; e; e = e->next)
+            classifications.apply_face(e->start, e->len, FACE_HISTEXPAND, true);
+    }
+    set_history_expansions(list);
 }
 
-//------------------------------------------------------------------------------
-int host_remove_history(int rl_history_index, const char* line)
-{
-    if (!s_callbacks)
-        return 0;
 
-    return s_callbacks->remove_history(rl_history_index, line);
-}
 
 //------------------------------------------------------------------------------
 void host_filter_prompt()
@@ -347,7 +412,6 @@ void line_editor_impl::begin_line()
 
     m_bind_resolver.reset();
     m_command_offset = 0;
-    m_keys_size = 0;
     m_prev_key.reset();
 
     assert(!s_editor);
@@ -365,11 +429,16 @@ void line_editor_impl::begin_line()
     m_prev_generate.clear();
     m_prev_classify.clear();
     m_prev_command_word.clear();
+    m_prev_command_word_offset = -1;
     m_prev_command_word_quoted = false;
 
     m_words.clear();
     m_commands.clear();
     m_classify_words.clear();
+
+    m_override_needle = nullptr;
+    m_override_words.clear();
+    m_override_commands.clear();
 
     rl_before_display_function = before_display;
 
@@ -402,11 +471,10 @@ void line_editor_impl::end_line()
     s_callbacks = nullptr;
     g_word_collector = nullptr;
 
-    reset_suggester();
-
     clear_flag(flag_editing);
 
     assert(!m_in_matches_ready);
+    assert(!m_buffer.has_override());
 }
 
 //------------------------------------------------------------------------------
@@ -484,6 +552,33 @@ bool line_editor_impl::edit(str_base& out, bool edit)
 }
 
 //------------------------------------------------------------------------------
+void line_editor_impl::override_line(const char* line, const char* needle, int point)
+{
+    assert(!line || !m_buffer.has_override());
+    assert(!line || point >= 0);
+    assert(!line || point <= strlen(line));
+
+    m_buffer.override(line, point);
+    m_override_needle = line ? needle : nullptr;
+
+    m_override_words.clear();
+    m_override_commands.clear();
+    if (line)
+    {
+        collect_words(m_override_words, &m_matches, collect_words_mode::stop_at_cursor, m_override_commands);
+        set_flag(flag_generate);
+    }
+}
+
+//------------------------------------------------------------------------------
+#ifdef DEBUG
+bool line_editor_impl::is_line_overridden()
+{
+    return m_buffer.has_override();
+}
+#endif
+
+//------------------------------------------------------------------------------
 bool line_editor_impl::update()
 {
     if (!check_flag(flag_init))
@@ -546,8 +641,8 @@ bool line_editor_impl::notify_matches_ready(int generation_id, matches* matches)
     if (matches && generation_id == m_generation_id)
     {
         assert(&m_matches != matches);
-        m_matches.done_building();
         m_matches.transfer(*(matches_impl*)matches);
+        m_matches.done_building();
         clear_flag(flag_generate);
     }
     else
@@ -567,6 +662,9 @@ bool line_editor_impl::notify_matches_ready(int generation_id, matches* matches)
 //------------------------------------------------------------------------------
 void line_editor_impl::update_matches()
 {
+    if (m_matches.is_volatile())
+        reset_generate_matches();
+
     // Get flag states because we're about to clear them.
     bool generate = check_flag(flag_generate);
     bool restrict = check_flag(flag_restrict);
@@ -580,31 +678,29 @@ void line_editor_impl::update_matches()
 
     if (generate)
     {
-        const auto linestates = m_commands.get_linestates(m_buffer);
+        const auto linestates = (m_buffer.has_override() ?
+                                 m_override_commands.get_linestates(m_buffer) :
+                                 m_commands.get_linestates(m_buffer));
         match_pipeline pipeline(m_matches);
         pipeline.reset();
         pipeline.generate(linestates, m_generator);
     }
 
-    if (restrict)
+    if (restrict && !m_buffer.has_override())
     {
         match_pipeline pipeline(m_matches);
 
         // Strip quotes so `"foo\"ba` can complete to `"foo\bar"`.  Stripping
         // quotes may seem surprising, but it's what CMD does and it works well.
-        str<> tmp;
+        str_moveable tmp;
         concat_strip_quotes(tmp, m_needle.c_str(), m_needle.length());
 
         bool just_tilde = false;
-        if (rl_complete_with_tilde_expansion)
+        if (rl_complete_with_tilde_expansion && tmp.c_str()[0] == '~')
         {
-            char* expanded = tilde_expand(tmp.c_str());
-            if (expanded && strcmp(tmp.c_str(), expanded) != 0)
-            {
-                just_tilde = (tmp.c_str()[0] == '~' && tmp.c_str()[1] == '\0');
-                tmp = expanded;
-            }
-            free(expanded);
+            just_tilde = !tmp.c_str()[1];
+            if (!path::tilde_expand(tmp))
+                just_tilde = false;
         }
 
         m_needle = tmp.c_str();
@@ -615,18 +711,20 @@ void line_editor_impl::update_matches()
 
     if (select)
     {
+        const char* needle = m_buffer.has_override() ? m_override_needle : m_needle.c_str();
         match_pipeline pipeline(m_matches);
-        pipeline.select(m_needle.c_str());
+        pipeline.select(needle);
         pipeline.sort();
     }
 
     // Tell all the modules that the matches changed.
     if (generate || restrict || select)
     {
+        const char* needle = m_buffer.has_override() ? m_override_needle : m_needle.c_str();
         line_state line = get_linestate();
         editor_module::context context = get_context();
         for (auto module : m_modules)
-            module->on_matches_changed(context, line, m_needle.c_str());
+            module->on_matches_changed(context, line, needle);
     }
 }
 
@@ -742,10 +840,25 @@ bool line_editor_impl::update_input()
             return true;
         }
 
+        if (key == terminal_in::input_exit)
+        {
+            if (!m_dispatching)
+            {
+                m_buffer.reset();
+                m_buffer.insert("exit");
+                end_line();
+            }
+            return true;
+        }
+
         if (key < 0)
             return true;
 
-        if (!m_bind_resolver.step(key))
+        // `quoted-insert` should always behave as though the key resolved a
+        // binding, to ensure that Readline gets to handle the key (even Esc).
+        if (!m_bind_resolver.step(key) &&
+            !rl_is_insert_next_callback_pending() &&
+            !rl_vi_insert_mode_esc_special_case(key))
             return false;
     }
 
@@ -785,7 +898,7 @@ bool line_editor_impl::update_input()
             rollback<bind_resolver::binding*> _(m_pending_binding, &binding);
 
             editor_module::context context = get_context();
-            editor_module::input input = { chord.c_str(), chord.length(), id, binding.get_params() };
+            editor_module::input input = { chord.c_str(), chord.length(), id, m_bind_resolver.more_than(chord.length()), binding.get_params() };
             module->on_input(input, result, context);
 
             if (clink_is_signaled())
@@ -872,17 +985,26 @@ unsigned int line_editor_impl::collect_words(words& words, matches_impl* matches
     {
         if (words.size() > 0)
         {
+            bool command = true;
             tmp1.format("\x1b[s\x1b[%dHcollected words:        ", dbg_row);
             m_printer.print(tmp1.c_str(), tmp1.length());
             for (auto const& w : words)
             {
                 const char* q = w.quoted ? "\"" : "";
+                if (w.command_word)
+                    command = true;
                 if (w.is_redir_arg)
                     m_printer.print(">");
                 if (w.command_word)
                     m_printer.print("!");
+                const char* color = "37";
+                if (command && !w.is_redir_arg)
+                {
+                    command = false;
+                    color = "4;32";
+                }
                 if (w.length)
-                    tmp1.format("%s\x1b[0;37;7m%.*s\x1b[m%s ", q, w.length, m_buffer.get_buffer() + w.offset, q);
+                    tmp1.format("%s\x1b[0;%s;7m%.*s\x1b[m%s ", q, color, w.length, m_buffer.get_buffer() + w.offset, q);
                 else
                     tmp1.format("\x1b[0;37;7m \x1b[m ");
                 m_printer.print(tmp1.c_str(), tmp1.length());
@@ -911,19 +1033,29 @@ unsigned int line_editor_impl::collect_words(words& words, matches_impl* matches
 #ifdef DEBUG
         if (dbg_row > 0)
         {
+            bool command = true;
             int i_word = 1;
             tmp2.format("\x1b[s\x1b[%dHafter word break info:  ", dbg_row + 1);
             m_printer.print(tmp2.c_str(), tmp2.length());
-            for (auto const& w : commands.get_linestate(m_buffer).get_words())
+            auto const& after_break_words = commands.get_linestate(m_buffer).get_words();
+            for (auto const& w : after_break_words)
             {
                 const char* q = w.quoted ? "\"" : "";
+                if (w.command_word)
+                    command = true;
                 if (w.is_redir_arg)
                     m_printer.print(">");
                 if (w.command_word)
                     m_printer.print("!");
-                const char* color = (i_word == words.size()) ? "35;7" : "37;7";
-                const char* delim = (i_word + 1 == words.size()) ? "" : " ";
-                tmp2.format("%s\x1b[0;%sm%.*s\x1b[m%s", q, color, w.length, m_buffer.get_buffer() + w.offset, q, delim);
+                const char* color = "37;7";
+                if (command && !w.is_redir_arg)
+                {
+                    command = false;
+                    color = "4;32;7";
+                }
+                if (i_word == after_break_words.size())
+                    color = "35;7";
+                tmp2.format("%s\x1b[0;%sm%.*s\x1b[m%s ", q, color, w.length, m_buffer.get_buffer() + w.offset, q);
                 m_printer.print(tmp2.c_str(), tmp2.length());
                 i_word++;
             }
@@ -972,10 +1104,19 @@ void line_editor_impl::classify()
     word_classifications old_classifications(std::move(m_classifications));
     m_classifications.init(m_buffer.get_length(), &old_classifications);
 
-    // Use the full line; don't stop at the cursor.
-    commands commands = collect_commands();
-    m_classifier->classify(commands.get_linestates(m_buffer), m_classifications);
-    m_classifications.finish(is_showing_argmatchers());
+    if (RL_ISSTATE(RL_STATE_NSEARCH))
+    {
+        m_classifications.apply_face(0, m_buffer.get_length(), FACE_NORMAL);
+        m_classifications.finish(is_showing_argmatchers());
+    }
+    else
+    {
+        // Use the full line; don't stop at the cursor.
+        commands commands = collect_commands();
+        m_classifier->classify(commands.get_linestates(m_buffer), m_classifications);
+        classify_history_expansions(m_buffer, m_classifications);
+        m_classifications.finish(is_showing_argmatchers());
+    }
 
 #ifdef DEBUG
     if (dbg_get_env_int("DEBUG_CLASSIFY"))
@@ -1009,13 +1150,28 @@ void line_editor_impl::maybe_send_oncommand_event()
     if (line.get_word_count() <= 1)
         return;
 
-    const word& info = line.get_words()[0];
+    const word* p = nullptr;
+    for (size_t i = 0; i < line.get_words().size(); ++i)
+    {
+        const word& tmp = line.get_words()[i];
+        if (!tmp.is_redir_arg)
+        {
+            p = &tmp;
+            break;
+        }
+    }
+    if (!p)
+        return;
+
+    const word& info = *p;
     if (m_prev_command_word_quoted == info.quoted &&
+        m_prev_command_word_offset == info.offset &&
         m_prev_command_word.length() == info.length &&
         _strnicmp(m_prev_command_word.c_str(), m_buffer.get_buffer() + info.offset, info.length) == 0)
         return;
 
     str<> first_word;
+    unsigned int offset = info.offset;
     bool quoted = info.quoted;
     first_word.concat(line.get_line() + info.offset, info.length);
 
@@ -1054,6 +1210,7 @@ void line_editor_impl::maybe_send_oncommand_event()
     }
 
     m_prev_command_word = first_word.c_str();
+    m_prev_command_word_offset = offset;
     m_prev_command_word_quoted = quoted;
 }
 
@@ -1095,6 +1252,9 @@ void host_refresh_recognizer()
 //------------------------------------------------------------------------------
 line_state line_editor_impl::get_linestate() const
 {
+    if (m_buffer.has_override())
+        return m_override_commands.get_linestate(m_buffer);
+
     return m_commands.get_linestate(m_buffer);
 }
 
@@ -1320,7 +1480,7 @@ void line_editor_impl::try_suggest()
                 // Removable drives are accepted because typically these are
                 // thumb drives these days, which are fast.
                 const char* end_word = m_buffer.get_buffer() + word.offset;
-                bool no_matches = (path::is_separator(end_word[0]) && path::is_separator(end_word[1]));
+                bool no_matches = path::is_unc(end_word);
                 if (!no_matches)
                 {
                     str<> full;

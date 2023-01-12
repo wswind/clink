@@ -48,6 +48,9 @@ local function setup_cfg(cfg)
 
     configuration({cfg, "x64"})
         targetsuffix("_x64")
+
+    configuration({cfg, "arm64"})
+        targetsuffix("_arm64")
 end
 
 
@@ -126,18 +129,22 @@ local function write_clink_commit_file(commit)
     end
 end
 
+--------------------------------------------------------------------------------
+if _ACTION then
+    local workspace = (_ACTION:find("^vs") or _ACTION:find("^gmake"))
+    local docs = (_ACTION == "docs")
+    if workspace or docs then
+        clink_git_name, clink_git_commit = get_git_info()
+        write_clink_commit_file(clink_git_commit)
+    end
+end
+
 
 
 --------------------------------------------------------------------------------
-clink_git_name, clink_git_commit = get_git_info()
-
--- Ideally I want to write clink_commit.h only when generating a workspace.
--- But for now it runs on _ALL_ actions.
-write_clink_commit_file(clink_git_commit)
-
 workspace("clink")
     configurations({"debug", "release", "final"})
-    platforms({"x32", "x64"})
+    platforms({"x32", "x64", "arm64"})
     location(to)
 
     characterset("MBCS")
@@ -159,7 +166,8 @@ workspace("clink")
         defines("_DEBUG")
 
     configuration("final")
-        rtti("off")
+        --rtti("off")
+        rtti("on")
         optimize("full")
         omitframepointer("on")
         flags("NoBufferSecurityCheck")
@@ -169,7 +177,8 @@ workspace("clink")
         flags("LinkTimeOptimization")
 
     configuration("release")
-        rtti("off")
+        --rtti("off")
+        rtti("on")
         optimize("full")
         defines("NDEBUG")
 
@@ -201,6 +210,7 @@ project("readline")
     defines("BUILD_READLINE")
     includedirs("readline")
     includedirs("readline/compat")
+    includedirs("wildmatch/wildmatch")
     files("readline/readline/*.c")
     files("readline/readline/*.h")
     files("readline/compat/*.c")
@@ -215,6 +225,13 @@ project("getopt")
     language("c")
     kind("staticlib")
     files("getopt/*")
+
+--------------------------------------------------------------------------------
+project("wildmatch")
+    language("c")
+    kind("staticlib")
+    files("wildmatch/wildmatch/*.c")
+    files("wildmatch/wildmatch/*.h")
 
 --------------------------------------------------------------------------------
 project("lua")
@@ -383,6 +400,7 @@ clink_dll("clink_app_dll")
     links("clink_terminal")
     links("detours")
     links("getopt")
+    links("wildmatch")
     links("lua")
     links("readline")
     links("version")
@@ -398,6 +416,7 @@ clink_dll("clink_app_dll")
         buildoptions("-fpermissive")
         buildoptions("-std=c++17")
         links("gdi32")
+        links("ole32")
 
 --------------------------------------------------------------------------------
 clink_exe("clink_app_exe")
@@ -433,6 +452,7 @@ clink_exe("clink_test")
     links("clink_lua")
     links("clink_process")
     links("clink_terminal")
+    links("wildmatch")
     links("lua")
     links("readline")
     links("shlwapi")
@@ -445,6 +465,7 @@ clink_exe("clink_test")
     includedirs("clink/lib/src")
     includedirs("clink/lua/include")
     includedirs("clink/terminal/include")
+    includedirs("wildmatch/wildmatch")
     includedirs("lua/src")
     includedirs("readline")
     includedirs("readline/compat")
@@ -454,6 +475,7 @@ clink_exe("clink_test")
     files("clink/lib/test/*.cpp")
     files("clink/terminal/test/*.cpp")
     files("clink/test/**")
+    files("wildmatch/tests/*.cpp")
 
     exceptionhandling("on")
 
@@ -465,6 +487,7 @@ clink_exe("clink_test")
         buildoptions("-fpermissive")
         buildoptions("-std=c++17")
         links("gdi32")
+        links("ole32")
         linkgroups("on")
 
 --------------------------------------------------------------------------------

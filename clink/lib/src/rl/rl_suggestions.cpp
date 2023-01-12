@@ -68,6 +68,7 @@ void suggestion_manager::clear()
     m_line.free();
     m_suggestion_offset = -1;
     m_endword_offset = -1;
+    m_accepted_whole = false;
 }
 
 //------------------------------------------------------------------------------
@@ -79,13 +80,37 @@ bool suggestion_manager::can_suggest(const line_state& line)
     if (m_paused)
         return false;
 
+    if (RL_ISSTATE(RL_STATE_NSEARCH))
+    {
+        clear();
+        g_rl_buffer->set_need_draw();
+        g_rl_buffer->draw();
+        return false;
+    }
+
     assert(line.get_cursor() == g_rl_buffer->get_cursor());
     assert(line.get_length() == g_rl_buffer->get_length());
     assert(strncmp(line.get_line(), g_rl_buffer->get_buffer(), line.get_length()) == 0);
     if (g_rl_buffer->get_cursor() != g_rl_buffer->get_length())
+    {
+        clear();
         return false;
+    }
     if (g_rl_buffer->get_anchor() >= 0)
         return false;
+
+    const bool diff = (m_line.length() != g_rl_buffer->get_length() ||
+                       strncmp(m_line.c_str(), g_rl_buffer->get_buffer(), m_line.length()) != 0);
+
+    // Must check this AFTER checking cursor at end, so that moving the cursor
+    // can clear the flag.
+    if (accepted_whole_suggestion())
+    {
+        if (diff)
+            clear();
+        else
+            return false;
+    }
 
     // Update the endword offset.  Inserting part of a suggestion can't know
     // what the new endword offset will be, so this allows updating it when the
@@ -94,8 +119,7 @@ bool suggestion_manager::can_suggest(const line_state& line)
 
     // The buffers are not necessarily nul terminated!  Because of how
     // hook_display() hacks suggestions into the Readline display.
-    return (m_line.length() != g_rl_buffer->get_length() ||
-            strncmp(m_line.c_str(), g_rl_buffer->get_buffer(), m_line.length()) != 0);
+    return diff;
 }
 
 //------------------------------------------------------------------------------
@@ -212,6 +236,8 @@ bool suggestion_manager::insert(suggestion_action action)
             g_rl_buffer->end_undo_group();
         }
         clear();
+        m_line.concat(g_rl_buffer->get_buffer(), g_rl_buffer->get_length());
+        m_accepted_whole = true;
         return !orig_iter.more();
     }
 
@@ -322,15 +348,14 @@ bool suggestion_manager::insert(suggestion_action action)
     // End the undo group.
     g_rl_buffer->end_undo_group();
 
-    if (trunc)
-    {
-        m_line.clear();
-        m_line.concat(g_rl_buffer->get_buffer(), g_rl_buffer->get_length());
-    }
-    else
+    if (!trunc)
     {
         clear();
+        m_accepted_whole = true;
     }
+
+    m_line.clear();
+    m_line.concat(g_rl_buffer->get_buffer(), g_rl_buffer->get_length());
 
     return true;
 }

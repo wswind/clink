@@ -32,10 +32,11 @@ extern int              _rl_last_v_pos;
 }
 
 extern matches* get_mutable_matches(bool nosort=false);
+extern void force_update_internal(bool restrict);
 extern const char* get_last_luafunc();
 extern void override_rl_last_func(rl_command_func_t* func, bool force_when_null=false);
 
-extern int count_prompt_lines(const char* prompt_prefix, int len);
+extern int count_prompt_lines(const char* prompt_prefix);
 
 
 
@@ -47,18 +48,17 @@ bool collapse_tilde(const char* in, str_base& out, bool force)
     if (expand_tilde && !force)
         return false;
 
-    char *tilde = tilde_expand("~");
-    if (!tilde)
+    str_moveable tilde;
+    if (!path::tilde_expand("~", tilde))
         return false;
 
-    int tilde_len = int(strlen(tilde));
-    int j = str_compare(in, tilde);
-    free(tilde);
-
-    if (j >= 0 && j != tilde_len)
+    str_iter in_iter(in);
+    str_iter tilde_iter(tilde.c_str());
+    int j = str_compare(in_iter, tilde_iter);
+    if (j >= 0 && in_iter.more())
         return false;
 
-    out.format("~%s", in + tilde_len);
+    out.format("~%s", in_iter.get_pointer());
     return true;
 }
 
@@ -86,13 +86,13 @@ static void unquote_keys(const char* in, str_base& out)
 /// -arg:   path:string
 /// -arg:   [force:boolean]
 /// -ret:   string
-/// Undoes Readline tilde expansion.  See <a href="#rl.expandtilde">rl.expandtilde</a>
-/// for more information.
-/// -show:  rl.collapsetilde("C:\Users\yourusername\Documents")
+/// Undoes Readline tilde expansion.  See
+/// <a href="#rl.expandtilde">rl.expandtilde()</a> for more information.
+/// -show:  rl.collapsetilde("C:\\Users\\yourusername\\Documents")
 /// -show:  &nbsp;
 /// -show:  -- The return value depends on the expand-tilde configuration variable:
-/// -show:  -- When "on", the function returns "C:\Users\yourusername\Documents".
-/// -show:  -- When "off", the function returns "~\Documents".
+/// -show:  -- When "on", the function returns "C:\\Users\\yourusername\\Documents".
+/// -show:  -- When "off", the function returns "~\\Documents".
 /// -show:  &nbsp;
 /// -show:  -- Or when <span class="arg">force</span> is true, the function returns "~\Documents".
 static int collapse_tilde(lua_State* state)
@@ -115,21 +115,27 @@ static int collapse_tilde(lua_State* state)
 /// -name:  rl.expandtilde
 /// -ver:   1.1.6
 /// -arg:   path:string
+/// -arg:   [whole_line:boolean]
 /// -ret:   string, boolean
 /// Performs Readline tilde expansion.
 ///
 /// When generating filename matches for a word, use the
-/// <a href="#rl.expandtilde">rl.expandtilde</a> and
-/// <a href="#rl.collapsetilde">rl.collapsetilde</a> helper functions to perform
+/// <a href="#rl.expandtilde">rl.expandtilde()</a> and
+/// <a href="#rl.collapsetilde">rl.collapsetilde()</a> helper functions to perform
 /// tilde completion expansion according to Readline's configuration.
 ///
-/// Use <a href="#rl.expandtilde">rl.expandtilde</a> to do tilde expansion
+/// An optional <span class="arg">whole_line</span> argument selects whether to
+/// expand tildes everywhere in the input string (pass true), or to expand only
+/// a tilde at the beginning of the input string (pass false or omit the
+/// second argument).  See the Compatibility Note below for more information.
+///
+/// Use <a href="#rl.expandtilde">rl.expandtilde()</a> to do tilde expansion
 /// before collecting file matches (e.g. via
-/// <a href="#os.globfiles">os.globfiles</a>).  If it indicates that it expanded
-/// the string, then use <a href="#rl.collapsetilde">rl.collapsetilde</a> to put
+/// <a href="#os.globfiles">os.globfiles()</a>).  If it indicates that it expanded
+/// the string, then use <a href="#rl.collapsetilde">rl.collapsetilde()</a> to put
 /// back the tilde before returning a match.
-/// -show:  local result, expanded = rl.expandtilde("~\Documents")
-/// -show:  -- result is "C:\Users\yourusername\Documents"
+/// -show:  local result, expanded = rl.expandtilde("~\\Documents")
+/// -show:  -- result is "C:\\Users\\yourusername\\Documents"
 /// -show:  -- expanded is true
 /// -show:
 /// -show:  -- This dir_matches function demonstrates efficient use of rl.expandtilde()
@@ -155,18 +161,72 @@ static int collapse_tilde(lua_State* state)
 /// -show:  &nbsp;   end
 /// -show:  &nbsp;   return matches
 /// -show:  end
+/// <fieldset><legend>Compatibility Note:</legend>
+/// The original intended usage for this function was to expand tildes in a
+/// single word.  But sometimes it may be convenient to expand tildes for an
+/// entire command line all at once.
+///
+/// Prior to v1.3.36, this function simply asked the Readline library to expand
+/// tildes, but that mode of operation doesn't respect quotes and has quirks
+/// that can produce unexpected results when the input is a single pathname
+/// (which was the documented supported usage).
+///
+/// In v1.3.36 this function fixed that problem, and expands tildes correctly
+/// a single pathname as the input (and also accepts quotes).  But that broke an
+/// undocumented quirk that could expand tildes for a whole command line as
+/// the input.
+///
+/// In v1.3.37 and newer, this function accepts a boolean second argument which
+/// selects whether to expand for a whole input line using the quirky Readline
+/// tilde expansion (pass true), or to expand for a single pathname as the input
+/// (pass false or omit the second argument).
+///
+/// Passing true for the second argument causes any version of Clink (except
+/// v1.3.36) to expand the input as a whole command line.
+/// </fieldset>
 static int expand_tilde(lua_State* state)
 {
-    const char* path = checkstring(state, 1);
-    if (!path)
+    const char* in = checkstring(state, 1);
+    bool whole_line = lua_toboolean(state, 2);
+    if (!in)
         return 0;
 
-    char* expanded_path = tilde_expand(path);
-    bool expanded = expanded_path && strcmp(path, expanded_path) != 0;
-    lua_pushstring(state, expanded_path ? expanded_path : path);
-    lua_pushboolean(state, expanded);
-    free(expanded_path);
-    return 2;
+    if (whole_line)
+    {
+        char* expanded_path = tilde_expand(in);
+        bool expanded = expanded_path && strcmp(in, expanded_path) != 0;
+        lua_pushstring(state, expanded_path ? expanded_path : in);
+        lua_pushboolean(state, expanded);
+        free(expanded_path);
+        return 2;
+    }
+    else
+    {
+        // Strip all quotes.
+        const bool quote = (in[0] == '"');
+        str<> tmp;
+        for (const char* walk = in; *walk; ++walk)
+        {
+            if (*walk != '"')
+                tmp.concat(walk, 1);
+        }
+
+        // Expand the input as a single word.
+        str<> expanded_path;
+        bool expanded = tmp.c_str()[0] == '~' && path::tilde_expand(tmp.c_str(), expanded_path);
+
+        // Add quotes again if the input originally started with a quote.
+        str<> out;
+        if (quote)
+            out << "\"";
+        out << (expanded ? expanded_path.c_str() : tmp.c_str());
+        if (quote)
+            out << "\"";
+
+        lua_pushstring(state, out.c_str());
+        lua_pushboolean(state, expanded);
+        return 2;
+    }
 }
 
 //------------------------------------------------------------------------------
@@ -467,6 +527,14 @@ static int invoke_command(lua_State* state)
     if (!command)
         return 0;
 
+    // Must force update_internal() in case a completion command is invoked (or
+    // anything uses line_state).  Updating matches in alternative_matches() is
+    // too late, because the word break info needs to have already been updated
+    // before alternative_matches() is reached.  The update_internal() stuff
+    // already is optimized to do nothing if the input line hasn't changed since
+    // the last time update_internal() was called.
+    force_update_internal(false/*restrict*/);
+
     if (*command == '"')
     {
         str<> tmp(command + 1);
@@ -753,15 +821,11 @@ static int get_prompt_info(lua_State* state)
 
     lua_createtable(state, 0, 7);
 
-    str_moveable bracketed_prefix;
     const char* prefix = rl_get_local_prompt_prefix();
-    if (prefix)
-    {
-        ecma48_processor_flags flags = ecma48_processor_flags::bracket;
-        ecma48_processor(prefix, &bracketed_prefix, nullptr/*cell_count*/, flags);
-    }
+    const char* prompt = rl_get_local_prompt();
 
-    int prefix_lines = count_prompt_lines(bracketed_prefix.c_str(), bracketed_prefix.length());
+    int prefix_lines = count_prompt_lines(prefix);
+    int prompt_lines = count_prompt_lines(prompt);
 
     lua_pushliteral(state, "promptprefix");
     lua_pushstring(state, prefix);
@@ -772,7 +836,7 @@ static int get_prompt_info(lua_State* state)
     lua_rawset(state, -3);
 
     lua_pushliteral(state, "prompt");
-    lua_pushstring(state, rl_get_local_prompt());
+    lua_pushstring(state, prompt);
     lua_rawset(state, -3);
 
     if (rl_rprompt)
@@ -785,10 +849,12 @@ static int get_prompt_info(lua_State* state)
     CONSOLE_SCREEN_BUFFER_INFO csbi;
     if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi))
     {
-        int input_line = csbi.dwCursorPosition.Y - _rl_last_v_pos;
+        int anchor = csbi.dwCursorPosition.Y - _rl_last_v_pos;
+        int prompt_line = anchor - prefix_lines;
+        int input_line = anchor + prompt_lines;
 
         lua_pushliteral(state, "promptline");
-        lua_pushinteger(state, 1 + input_line - prefix_lines);
+        lua_pushinteger(state, 1 + prompt_line);
         lua_rawset(state, -3);
 
         lua_pushliteral(state, "inputline");
@@ -796,7 +862,7 @@ static int get_prompt_info(lua_State* state)
         lua_rawset(state, -3);
 
         lua_pushliteral(state, "inputlinecount");
-        lua_pushinteger(state, 1 + _rl_vis_botlin);
+        lua_pushinteger(state, 1 + _rl_vis_botlin - prompt_lines);
         lua_rawset(state, -3);
     }
 
@@ -842,7 +908,7 @@ static int getset_insert_mode(lua_State* state)
 /// -show:  local normal = "\x1b[m"
 /// -show:
 /// -show:  local function get_settings_color(name)
-/// -show:      return "\x1b[" .. settings.get(name) .. "m"
+/// -show:  &nbsp;   return "\x1b[" .. settings.get(name) .. "m"
 /// -show:  end
 /// -show:
 /// -show:  function p:filter(prompt)
@@ -933,6 +999,134 @@ static int get_match_color(lua_State* state)
     return 1;
 }
 
+//------------------------------------------------------------------------------
+/// -name:  rl.gethistorycount
+/// -ver:   1.3.18
+/// -ret:   integer
+/// Returns the number of history items.
+static int get_history_count(lua_State* state)
+{
+    lua_pushinteger(state, history_length);
+    return 1;
+}
+
+//------------------------------------------------------------------------------
+/// -name:  rl.gethistoryitems
+/// -ver:   1.3.18
+/// -ret:   start:integer
+/// -ret:   end:integer
+/// Returns a table of history items.
+///
+/// The first history item is 1, and the last history item is
+/// <a href="#rl.gethistorycount">rl.gethistorycount()</a>.  For best
+/// performance, use <span class="arg">start</span> and
+/// <span class="arg">end</span> to request only the range of history items that
+/// will be needed.
+///
+/// Each history item is a table with the following scheme:
+/// -show:  local h = rl.gethistoryitems(1, rl.gethistorycount())
+/// -show:  -- h.line       [string] The item's command line string.
+/// -show:  -- h.time       [integer or nil] The item's time, compatible with os.time().
+///
+/// <strong>Note:</strong> the time field is omitted if the history item does
+/// not have an associated time.
+static int get_history_items(lua_State* state)
+{
+    bool isnum;
+    int start = checkinteger(state, 1, &isnum) - 1;
+    if (!isnum)
+        return 0;
+    int end = checkinteger(state, 2, &isnum);
+    if (!isnum)
+        return 0;
+
+    if (start >= history_length || end < 1)
+        return 0;
+    if (start < 0)
+        start = 0;
+    if (end > history_length)
+        end = history_length;
+
+    lua_createtable(state, (end - start) - 1, 0);
+
+    HIST_ENTRY const* const* const items = history_list();
+    int index = 0;
+    for (int i = start; i < end; ++i)
+    {
+        lua_createtable(state, 0, 2);
+
+        lua_pushliteral(state, "line");
+        lua_pushstring(state, items[i]->line);
+        lua_rawset(state, -3);
+
+        if (items[i]->timestamp)
+        {
+            lua_pushliteral(state, "time");
+            lua_pushinteger(state, atoi(items[i]->timestamp));
+            lua_rawset(state, -3);
+        }
+
+        lua_rawseti(state, -2, ++index);
+    }
+    return 1;
+}
+
+//------------------------------------------------------------------------------
+/// -name:  rl.describemacro
+/// -ver:   1.3.41
+/// -arg:   macro:string
+/// -arg:   description:string
+/// This associates <span class="arg">description</span> with
+/// <span class="arg">macro</span>, to be displayed in the
+/// <code>clink-show-help</code> and <code>clink-what-is</code> commands.
+///
+/// This may be used to add a description for a <code>luafunc:</code> macro, or
+/// for a keyboard macro.
+///
+/// The <span class="arg">macro</span> string should include quotes, just like
+/// in <code>rl.setbinding()</code>.  If quotes are not present, they are added
+/// automatically.
+/// -show:  rl.describemacro([["luafunc:mycommand"]], "Does whatever mycommand does")
+/// -show:  rl.describemacro([["\e[Hrem "]], "Insert 'rem ' at the beginning of the line")
+/// -show:  rl.setbinding([["\C-o"]], [["luafunc:mycommand"]])
+/// -show:  rl.setbinding([["\C-r"]], [["\e[Hrem "]])
+/// -show:  -- Press Alt-H to see the list of key bindings and descriptions.
+static int describe_macro(lua_State* state)
+{
+    const char* macro = checkstring(state, 1);
+    const char* description = checkstring(state, 2);
+    if (macro && description)
+    {
+        str<> tmp;
+        if (macro[0] != '\"' || (macro[0] && macro[strlen(macro) - 1] != '\"'))
+        {
+            tmp << "\"" << macro << "\"";
+            macro = tmp.c_str();
+        }
+
+        extern void add_macro_description(const char* macro, const char* desc);
+        add_macro_description(macro, description);
+    }
+    return 0;
+}
+
+//------------------------------------------------------------------------------
+/// -name:  rl.needquotes
+/// -ver:   1.4.8
+/// -arg:   text:string
+/// -ret:   boolean
+/// Returns whether the <span class="arg">text</span> needs quotes to be parsed
+/// correctly in a command line.
+static int need_quotes(lua_State* state)
+{
+    const char* text = checkstring(state, 1);
+    const bool need = (text &&
+                       //rl_filename_quote_characters &&
+                       _rl_strpbrk(text, rl_filename_quote_characters) != 0);
+    lua_pushboolean(state, need);
+    return 1;
+}
+
 
 
 //------------------------------------------------------------------------------
@@ -957,6 +1151,10 @@ void rl_lua_initialise(lua_state& lua)
         { "insertmode",             &getset_insert_mode },
         { "ismodifiedline",         &is_modified_line },
         { "getmatchcolor",          &get_match_color },
+        { "gethistorycount",        &get_history_count },
+        { "gethistoryitems",        &get_history_items },
+        { "describemacro",          &describe_macro },
+        { "needquotes",             &need_quotes },
     };
 
     lua_State* state = lua.get_state();

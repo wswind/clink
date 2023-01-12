@@ -1,4 +1,4 @@
-// Copyright (c) 2021 Christopher Antos
+﻿// Copyright (c) 2021 Christopher Antos
 // License: http://opensource.org/licenses/MIT
 
 #include "pch.h"
@@ -31,10 +31,16 @@ extern int _rl_last_v_pos;
 enum {
     bind_id_textlist_up = 60,
     bind_id_textlist_down,
+    bind_id_textlist_left,
+    bind_id_textlist_right,
+    bind_id_textlist_ctrlleft,
+    bind_id_textlist_ctrlright,
     bind_id_textlist_pgup,
     bind_id_textlist_pgdn,
     bind_id_textlist_home,
     bind_id_textlist_end,
+    bind_id_textlist_ctrlhome,
+    bind_id_textlist_ctrlend,
     bind_id_textlist_findincr,
     bind_id_textlist_findnext,
     bind_id_textlist_findprev,
@@ -59,6 +65,7 @@ extern setting_bool g_fuzzy_accent;
 extern const char* get_popup_colors();
 extern const char* get_popup_desc_colors();
 extern int host_remove_history(int rl_history_index, const char* line);
+extern bool host_remove_dir_history(int index);
 extern int clink_is_signaled();
 extern void force_signaled_redisplay();
 
@@ -143,17 +150,43 @@ static void make_spaces(int num, str_base& out)
 }
 
 //------------------------------------------------------------------------------
-static int limit_cells(const char* in, int limit, int& cells)
+static int limit_cells(const char* in, int limit, int& cells, int* horz_offset=nullptr)
 {
     cells = 0;
     str_iter iter(in, strlen(in));
-    while (int c = iter.next())
+
+    if (horz_offset)
     {
+        int skip = *horz_offset;
+        const char* const orig = in;
+        while (skip > 0)
+        {
+            const int c = iter.next();
+            if (!c)
+                break;
+            const int width = clink_wcwidth(c);
+            if (width > 0)
+            {
+                skip -= width;
+                in = iter.get_pointer();
+            }
+        }
+        *horz_offset = int(in - orig);
+    }
+
+    const char* end = in;
+    while (true)
+    {
+        end = iter.get_pointer();
+        const int c = iter.next();
+        if (!c)
+            break;
         cells += clink_wcwidth(c);
-        if (cells >= limit)
+        if (cells > limit)
             break;
     }
-    return int(iter.get_pointer() - in);
+
+    return int(end - in);
 }
 
 //------------------------------------------------------------------------------
@@ -172,6 +205,24 @@ static bool strstr_compare(const str_base& needle, const char* haystack)
     }
 
     return false;
+}
+
+
+
+//------------------------------------------------------------------------------
+popup_results::popup_results(popup_result result, int index, const char* text)
+    : m_result(result)
+    , m_index(index)
+    , m_text(text)
+{
+}
+
+//------------------------------------------------------------------------------
+void popup_results::clear()
+{
+    m_result = popup_result::cancel;
+    m_index = -1;
+    m_text.free();
 }
 
 
@@ -209,6 +260,7 @@ const char* textlist_impl::addl_columns::add_entry(const char* ptr)
     {
         str<> tmp;
         int col = 0;
+        bool any_tabs = false;
         while (col < sizeof_array(column_text.column))
         {
             const char* tab = strchr(ptr, '\t');
@@ -218,9 +270,11 @@ const char* textlist_impl::addl_columns::add_entry(const char* ptr)
             ptr = tab;
             if (!ptr)
                 break;
+            any_tabs = true;
             col++;
             ptr++;
         }
+        m_any_tabs |= any_tabs;
     }
 
     m_rows.emplace_back(std::move(column_text));
@@ -229,11 +283,18 @@ const char* textlist_impl::addl_columns::add_entry(const char* ptr)
 }
 
 //------------------------------------------------------------------------------
+bool textlist_impl::addl_columns::get_any_tabs() const
+{
+    return m_any_tabs;
+}
+
+//------------------------------------------------------------------------------
 void textlist_impl::addl_columns::clear()
 {
     std::vector<column_text> zap;
     m_rows = std::move(zap);
     memset(&m_longest, 0, sizeof(m_longest));
+    m_any_tabs = false;
 }
 
 
@@ -246,7 +307,7 @@ textlist_impl::textlist_impl(input_dispatcher& dispatcher)
 }
 
 //------------------------------------------------------------------------------
-popup_results textlist_impl::activate(const char* title, const char** entries, int count, int index, bool reverse, int history_mode, entry_info* infos, bool has_columns)
+popup_results textlist_impl::activate(const char* title, const char** entries, int count, int index, bool reverse, textlist_mode mode, entry_info* infos, bool has_columns, const popup_config* config)
 {
     reset();
     m_results.clear();
@@ -262,24 +323,38 @@ popup_results textlist_impl::activate(const char* title, const char** entries, i
     if (RL_ISSTATE(RL_STATE_MACRODEF) != 0)
         return popup_result::error;
 
+    // Attach to list of items.
+    m_entries = entries;
+    m_infos = infos;
+    m_count = count;
+
     // Make sure there's room.
-    m_reverse = reverse;
-    m_history_mode = (history_mode != 0);
-    m_win_history = (history_mode == 2);
+    m_reverse = config ? config->reverse : reverse;
+    m_pref_height = config ? config->height : 0;
+    m_pref_width = config ? config->width : 0;
+    m_mode = mode;
+    m_history_mode = is_history_mode(mode);
+    m_show_numbers = m_history_mode;
+    m_win_history = (mode == textlist_mode::win_history);
+    m_del_callback = config ? config->del_callback : nullptr;
     update_layout();
     if (m_visible_rows <= 0)
     {
         m_reverse = false;
+        m_pref_height = 0;
+        m_pref_width = 0;
+        m_mode = textlist_mode::general;
         m_history_mode = false;
+        m_show_numbers = false;
         m_win_history = false;
         return popup_result::error;
     }
 
+    // Initialize colors.
+    init_colors(config);
+
     // Gather the items.
     str<> tmp;
-    m_entries = entries;
-    m_infos = infos;
-    m_count = count;
     for (int i = 0; i < count; i++)
     {
         const char* text;
@@ -291,6 +366,7 @@ popup_results textlist_impl::activate(const char* title, const char** entries, i
         m_items.push_back(m_store.add(tmp.c_str()));
     }
     m_has_columns = has_columns;
+    m_horz_scrolling = !m_has_columns;
 
     if (title && *title)
         m_default_title = title;
@@ -374,10 +450,16 @@ void textlist_impl::bind_input(binder& binder)
 
     binder.bind(m_bind_group, "\\e[A", bind_id_textlist_up);            // Up
     binder.bind(m_bind_group, "\\e[B", bind_id_textlist_down);          // Down
+    binder.bind(m_bind_group, "\\e[D", bind_id_textlist_left);          // Left
+    binder.bind(m_bind_group, "\\e[C", bind_id_textlist_right);         // Right
+    binder.bind(m_bind_group, "\\e[1;5D", bind_id_textlist_ctrlleft);   // Ctrl+Left
+    binder.bind(m_bind_group, "\\e[1;5C", bind_id_textlist_ctrlright);  // Ctrl+Right
     binder.bind(m_bind_group, "\\e[5~", bind_id_textlist_pgup);         // PgUp
     binder.bind(m_bind_group, "\\e[6~", bind_id_textlist_pgdn);         // PgDn
     binder.bind(m_bind_group, "\\e[H", bind_id_textlist_home);          // Home
     binder.bind(m_bind_group, "\\e[F", bind_id_textlist_end);           // End
+    binder.bind(m_bind_group, "\\e[1;5H", bind_id_textlist_ctrlhome);   // Ctrl+Home
+    binder.bind(m_bind_group, "\\e[1;5F", bind_id_textlist_ctrlend);    // Ctrl+End
     binder.bind(m_bind_group, "\\eOR", bind_id_textlist_findnext);      // F3
     binder.bind(m_bind_group, "\\e[1;2R", bind_id_textlist_findprev);   // Shift+F3
     binder.bind(m_bind_group, "^l", bind_id_textlist_findnext);         // Ctrl+L
@@ -563,7 +645,7 @@ find:
                 {
                     m_index = i;
                     if (m_index < m_top || m_index >= m_top + m_visible_rows)
-                        m_top = max<int>(0, min<int>(m_index, m_count - m_visible_rows));
+                        m_top = max<int>(0, min<int>(m_index - (m_visible_rows / 2), m_count - m_visible_rows));
                     m_prev_displayed = -1;
                     need_display = true;
                     break;
@@ -588,15 +670,39 @@ find:
         break;
 
     case bind_id_textlist_delete:
-        if (m_history_mode)
         {
-            m_reset_history_index = true;
-            // Remove the corresponding persisted history entry.
-            const int history_index = m_infos ? m_infos[m_index].index : m_index;
-            host_remove_history(history_index, nullptr);
-            // Remove the corresponding entry from Readline's copy of history.
-            HIST_ENTRY* hist = remove_history(history_index);
-            free_history_entry(hist);
+            // Remove the entry.
+            const int external_index = m_infos ? m_infos[m_index].index : m_index;
+            if (m_history_mode)
+            {
+                m_reset_history_index = true;
+                // Remove the corresponding persisted history entry.
+                host_remove_history(external_index, nullptr);
+                // Remove the corresponding entry from Readline's copy of history.
+                HIST_ENTRY* hist = remove_history(external_index);
+                free_history_entry(hist);
+            }
+            else if (m_mode == textlist_mode::directories)
+            {
+                if (!host_remove_dir_history(external_index))
+                {
+                    rl_ding();
+                    break;
+                }
+            }
+            else if (m_del_callback)
+            {
+                if (!m_del_callback(external_index))
+                {
+                    rl_ding();
+                    break;
+                }
+            }
+            else
+            {
+                break;
+            }
+
             // Remove the item from the popup list.
             const int old_rows = min<int>(m_visible_rows, m_count);
             int move_count = (m_count - 1) - m_index;
@@ -614,9 +720,11 @@ find:
                 cancel(popup_result::cancel);
                 return;
             }
+
             // Move index.
             if (m_index > 0)
                 m_index--;
+
             // Redisplay.
             {
                 const int new_rows = min<int>(m_visible_rows, m_count);
@@ -674,7 +782,7 @@ find:
                     cancel(popup_result::cancel);
                     return;
                 }
-                if (p0 >= m_mouse_left && p0 < m_mouse_left + m_mouse_width)
+                if (p0 < m_mouse_left || p0 >= m_mouse_left + m_mouse_width)
                     break;
             }
             p1 -= m_mouse_offset;
@@ -723,6 +831,25 @@ find:
                 m_index += min<unsigned int>(m_count - 1 - m_index, p0);
             update_display();
         }
+        break;
+
+    case bind_id_textlist_left:
+        adjust_horz_offset(-1);
+        break;
+    case bind_id_textlist_right:
+        adjust_horz_offset(+1);
+        break;
+    case bind_id_textlist_ctrlleft:
+        adjust_horz_offset(-16);
+        break;
+    case bind_id_textlist_ctrlright:
+        adjust_horz_offset(+16);
+        break;
+    case bind_id_textlist_ctrlhome:
+        adjust_horz_offset(-999999);
+        break;
+    case bind_id_textlist_ctrlend:
+        adjust_horz_offset(+999999);
         break;
 
     case bind_id_textlist_backspace:
@@ -951,12 +1078,28 @@ void textlist_impl::update_layout()
 {
     int slop_rows = 2;
     int border_rows = 2;
-    int target_rows = m_history_mode ? 20 : 10;
+    int target_rows = m_pref_height;
 
-    m_visible_rows = min<int>(target_rows, (m_screen_rows / 2) - border_rows - slop_rows);
+    if (target_rows)
+    {
+        m_visible_rows = min<int>(target_rows, m_screen_rows - border_rows - slop_rows);
+    }
+    else
+    {
+        target_rows = m_history_mode ? 20 : 10;
+        m_visible_rows = min<int>(target_rows, (m_screen_rows / 2) - border_rows - slop_rows);
+    }
 
     if (m_screen_cols <= min_screen_cols)
         m_visible_rows = 0;
+
+    m_max_num_len = 0;
+    if (m_show_numbers && m_count > 0)
+    {
+        str<> tmp;
+        tmp.format("%u", m_infos ? m_infos[m_count - 1].index + 1 : m_count);
+        m_max_num_len = tmp.length();
+    }
 }
 
 //------------------------------------------------------------------------------
@@ -979,7 +1122,8 @@ void textlist_impl::update_top()
 }
 
 //------------------------------------------------------------------------------
-static void make_horz_border(const char* message, int col_width, bool bars, str_base& out)
+static void make_horz_border(const char* message, int col_width, bool bars, str_base& out,
+                             const char* header_color=nullptr, const char* border_color=nullptr)
 {
     out.clear();
 
@@ -988,6 +1132,12 @@ static void make_horz_border(const char* message, int col_width, bool bars, str_
         while (col_width-- > 0)
             out.concat("\xe2\x94\x80", 3);
         return;
+    }
+
+    if (!header_color || !border_color || _strcmpi(header_color, border_color) == 0)
+    {
+        header_color = nullptr;
+        border_color = nullptr;
     }
 
     int cells = 0;
@@ -1020,9 +1170,13 @@ static void make_horz_border(const char* message, int col_width, bool bars, str_
     }
 
     x += 1 + cells + 1;
+    if (header_color && border_color)
+        out.concat(header_color);
     out.concat(" ", 1);
     out.concat(message, len);
     out.concat(" ", 1);
+    if (header_color && border_color)
+        out.concat(border_color);
 
     bool cap = bars;
     for (int i = col_width - x; i-- > 0;)
@@ -1068,25 +1222,36 @@ void textlist_impl::update_display()
             const bool draw_border = (m_prev_displayed < 0) || m_override_title.length() || m_has_override_title;
             m_has_override_title = !m_override_title.empty();
 
-            str<> tmp;
-            int max_num_len = 0;
-            if (m_history_mode)
+            int longest;
+            if (m_pref_width)
             {
-                tmp.format("%u", m_infos ? m_infos[m_count - 1].index + 1 : m_count);
-                max_num_len = tmp.length();
+                longest = m_pref_width;
+                longest = max<int>(longest, 10); // Too narrow doesn't draw well.
+            }
+            else
+            {
+                longest = m_longest + (m_max_num_len ? m_max_num_len + 2 : 0); // +2 for ": ".
+                if (m_has_columns)
+                {
+                    for (int i = 0; i < max_columns; i++)
+                    {
+                        const int x = m_columns.get_col_width(i);
+                        if (x)
+                            longest += 2 + x;
+                    }
+                }
+                longest = max<int>(longest, 40);
             }
 
-            int longest = m_longest + (max_num_len ? max_num_len + 2 : 0); // +2 for ": ".
-            if (m_has_columns)
+            str<> tmp;
+            if (m_history_mode && m_prev_displayed < 0)
             {
-                for (int i = 0; i < max_columns; i++)
-                {
-                    const int x = m_columns.get_col_width(i);
-                    if (x)
-                        longest += 2 + x;
-                }
+                // Expand control characters to "^A" etc.
+                m_longest_visible = 0;
+                const int rows = min<int>(m_count, m_visible_rows);
+                for (int row = 0; row < rows; ++row)
+                    m_longest_visible = max<int>(m_longest_visible, make_item(m_items[m_top + row], tmp));
             }
-            longest = max<int>(longest, 40);
 
             const int effective_screen_cols = (m_screen_cols < 40) ? m_screen_cols : max<int>(40, m_screen_cols - 4);
             const int col_width = min<int>(longest + 2, effective_screen_cols); // +2 for borders.
@@ -1108,21 +1273,13 @@ void textlist_impl::update_display()
                 m_mouse_width = col_width - 2;
             }
 
-            str<32> color;
-            color.format("\x1b[%sm", get_popup_colors());
-
-            str<32> desc_color;
-            desc_color.format("\x1b[%sm", get_popup_desc_colors());
-
-            str<32> modmark;
-            modmark.format("%s*%s", desc_color.c_str(), color.c_str());
-
             // Display border.
             if (draw_border)
             {
-                make_horz_border(m_has_override_title ? m_override_title.c_str() : m_default_title.c_str(), col_width - 2, m_has_override_title, horzline);
+                make_horz_border(m_has_override_title ? m_override_title.c_str() : m_default_title.c_str(), col_width - 2, m_has_override_title, horzline,
+                                 m_color.header.c_str(), m_color.border.c_str());
                 m_printer->print(left.c_str(), left.length());
-                m_printer->print(color.c_str(), color.length());
+                m_printer->print(m_color.border.c_str(), m_color.border.length());
                 m_printer->print("\xe2\x94\x8c");                       // ┌
                 m_printer->print(horzline.c_str(), horzline.length());  // ─
                 m_printer->print("\xe2\x94\x90\x1b[m");                 // ┐
@@ -1144,37 +1301,46 @@ void textlist_impl::update_display()
                     i == m_prev_displayed)
                 {
                     m_printer->print(left.c_str(), left.length());
-                    m_printer->print(color.c_str(), color.length());
+                    m_printer->print(m_color.border.c_str(), m_color.border.length());
                     m_printer->print("\xe2\x94\x82");               // │
 
-                    if (i == m_index)
-                        m_printer->print("\x1b[7m");
+                    const str_base& maincolor = (i == m_index) ? m_color.select : m_color.items;
+                    m_printer->print(maincolor.c_str(), maincolor.length());
 
                     int spaces = col_width - 2;
 
-                    if (m_history_mode)
+                    if (m_show_numbers)
                     {
                         const int history_index = m_infos ? m_infos[i].index : i;
-                        const char* mark = (!m_infos || !m_infos[i].marked ? " " :
-                                            i == m_index ? "*" :
-                                            modmark.c_str());
+                        const char ismark = (m_infos && m_infos[i].marked);
+                        const char mark = ismark ? '*' : ' ';
+                        const char* color = !ismark ? "" : (i == m_index) ? m_color.selectmark.c_str() : m_color.mark.c_str();
+                        const char* uncolor = !ismark ? "" : (i == m_index) ? m_color.select.c_str() : m_color.items.c_str();
                         tmp.clear();
-                        tmp.format("%*u:%s", max_num_len, history_index + 1, mark);
+                        tmp.format("%*u:%s%c", m_max_num_len, history_index + 1, color, mark);
                         m_printer->print(tmp.c_str(), tmp.length());// history number
-                        spaces -= tmp.length();
-                        if (mark == modmark.c_str())
-                            spaces += modmark.length() - 1;
+                        spaces -= cell_count(tmp.c_str());
                     }
 
                     int cell_len;
-                    const int char_len = limit_cells(m_items[i], spaces, cell_len);
-                    m_printer->print(m_items[i], char_len);         // main text
+                    int offset = m_horz_offset;
+                    const int char_len = limit_cells(m_items[i], spaces, cell_len, &offset);
+                    m_printer->print(m_items[i] + offset, char_len);// main text
                     spaces -= cell_len;
 
                     if (m_has_columns)
                     {
-                        if (i != m_index)
-                            m_printer->print(desc_color.c_str(), desc_color.length());
+                        assert(!m_horz_scrolling); // Columns are incompatible with m_horz_offset.
+
+                        const str_base& desc_color = (i == m_index) ? m_color.selectdesc : m_color.desc;
+                        m_printer->print(desc_color.c_str(), desc_color.length());
+
+                        if (m_columns.get_any_tabs())
+                        {
+                            make_spaces(min<int>(spaces, m_longest - cell_len), tmp);
+                            m_printer->print(tmp.c_str(), tmp.length()); // spaces
+                            spaces -= tmp.length();
+                        }
 
                         for (int col = 0; col < max_columns && spaces > 0; col++)
                         {
@@ -1198,12 +1364,7 @@ void textlist_impl::update_display()
                     make_spaces(spaces, tmp);
                     m_printer->print(tmp.c_str(), tmp.length());    // spaces
 
-                    if (i == m_index)
-                        m_printer->print("\x1b[27m");
-
-                    if (m_has_columns)
-                        m_printer->print(color.c_str(), color.length());
-
+                    m_printer->print(m_color.border.c_str(), m_color.border.length());
                     m_printer->print("\xe2\x94\x82\x1b[m");         // │
                 }
             }
@@ -1213,9 +1374,10 @@ void textlist_impl::update_display()
             {
                 rl_crlf();
                 up++;
-                make_horz_border(m_history_mode ? "Del=Delete" : nullptr, col_width - 2, true/*bars*/, horzline);
+                const bool show_del = (m_history_mode || m_mode == textlist_mode::directories || m_del_callback);
+                make_horz_border(show_del ? "Del=Delete" : nullptr, col_width - 2, true/*bars*/, horzline, m_color.footer.c_str(), m_color.border.c_str());
                 m_printer->print(left.c_str(), left.length());
-                m_printer->print(color.c_str(), color.length());
+                m_printer->print(m_color.border.c_str(), m_color.border.length());
                 m_printer->print("\xe2\x94\x94");                       // └
                 m_printer->print(horzline.c_str(), horzline.length());  // ─
                 m_printer->print("\xe2\x94\x98\x1b[m");                 // ┘
@@ -1244,7 +1406,7 @@ void textlist_impl::update_display()
             m_printer->print(s.c_str(), s.length());
         }
         GetConsoleScreenBufferInfo(h, &csbi);
-        m_mouse_offset = csbi.dwCursorPosition.Y - csbi.srWindow.Top + 1/*to border*/ + 1/*to top item*/;
+        m_mouse_offset = csbi.dwCursorPosition.Y + 1/*to border*/ + 1/*to top item*/;
         _rl_move_vert(vpos);
         _rl_last_c_pos = cpos;
         GetConsoleScreenBufferInfo(h, &csbi);
@@ -1266,6 +1428,72 @@ void textlist_impl::set_top(int top)
 }
 
 //------------------------------------------------------------------------------
+void textlist_impl::adjust_horz_offset(int delta)
+{
+    if (m_horz_scrolling)
+    {
+        const int was = m_horz_offset;
+
+        m_horz_offset += delta;
+        m_horz_offset = min<int>(m_horz_offset, m_longest_visible - (m_mouse_width - m_max_num_len - 2 - 4));
+        m_horz_offset = max<int>(m_horz_offset, 0);
+
+        if (was != m_horz_offset)
+        {
+            m_prev_displayed = -1;
+            update_display();
+        }
+    }
+}
+
+//------------------------------------------------------------------------------
+static void init_color(const str_base* first, const str_base& second, str_base& out)
+{
+    if (first && first->length())
+        out.format("\x1b[0;%sm", first->c_str());
+    else
+        out = second.c_str();
+}
+
+//------------------------------------------------------------------------------
+void textlist_impl::init_colors(const popup_config* config)
+{
+    str<32> popup;
+    str<32> popupdesc;
+
+    if (config && config->colors.items.length())
+        popup.format("0;%s", config->colors.items.c_str());
+    else
+        popup = get_popup_colors();
+    if (config && config->colors.desc.length())
+        popupdesc.format("0;%s", config->colors.desc.c_str());
+    else
+        popupdesc = get_popup_desc_colors();
+
+    m_color.items.format("\x1b[%sm", popup.c_str());
+    m_color.desc.format("\x1b[%sm", popupdesc.c_str());
+
+    init_color(config ? &config->colors.border : nullptr, m_color.items, m_color.border);
+    init_color(config ? &config->colors.header : nullptr, m_color.border, m_color.header);
+    init_color(config ? &config->colors.footer : nullptr, m_color.border, m_color.footer);
+
+    init_color(config ? &config->colors.mark : nullptr, m_color.desc, m_color.mark);
+
+    if (config && config->colors.select.length())
+        m_color.select.format("\x1b[0;%sm", config->colors.select.c_str());
+    else
+        m_color.select.format("\x1b[0;%s;7m", popup.c_str());
+
+    if (config && config->colors.selectdesc.length())
+        m_color.selectdesc.format("\x1b[0;%sm", config->colors.selectdesc.c_str());
+    else
+        m_color.selectdesc.clear();
+
+    // Not supported yet; the mark is only used internally.
+    m_color.selectmark.clear();
+}
+
+//------------------------------------------------------------------------------
 void textlist_impl::reset()
 {
     std::vector<const char*> zap_items;
@@ -1273,6 +1501,9 @@ void textlist_impl::reset()
     // Don't reset screen row and cols; they stay in sync with the terminal.
 
     m_visible_rows = 0;
+    m_max_num_len = 0;
+    m_horz_offset = 0;
+    m_longest_visible = 0;
     m_default_title.clear();
     m_override_title.clear();
     m_has_override_title = false;
@@ -1284,9 +1515,16 @@ void textlist_impl::reset()
     m_items = std::move(zap_items);
     m_longest = 0;
     m_columns.clear();
+
+    m_mode = textlist_mode::general;
+    m_pref_height = 0;
+    m_pref_width = 0;
     m_history_mode = false;
+    m_show_numbers = false;
+    m_horz_scrolling = false;
     m_win_history = false;
     m_has_columns = false;
+    m_del_callback = nullptr;
 
     m_top = 0;
     m_index = 0;
@@ -1343,12 +1581,12 @@ void textlist_impl::item_store::clear()
 
 
 //------------------------------------------------------------------------------
-popup_results activate_text_list(const char* title, const char** entries, int count, int current, bool has_columns)
+popup_results activate_text_list(const char* title, const char** entries, int count, int current, bool has_columns, const popup_config* config)
 {
     if (!s_textlist)
         return popup_result::error;
 
-    return s_textlist->activate(title, entries, count, current, false/*reverse*/, false/*history_mode*/, nullptr, has_columns);
+    return s_textlist->activate(title, entries, count, current, false/*reverse*/, textlist_mode::general, nullptr, has_columns, config);
 }
 
 //------------------------------------------------------------------------------
@@ -1357,16 +1595,17 @@ popup_results activate_directories_text_list(const char** dirs, int count)
     if (!s_textlist)
         return popup_result::error;
 
-    return s_textlist->activate("Directories", dirs, count, count - 1, true/*reverse*/, false/*history_mode*/, nullptr, false);
+    return s_textlist->activate("Directories", dirs, count, count - 1, true/*reverse*/, textlist_mode::directories, nullptr, false);
 }
 
 //------------------------------------------------------------------------------
-popup_results activate_history_text_list(const char** history, int count, int current, entry_info* infos, int history_mode)
+popup_results activate_history_text_list(const char** history, int count, int current, entry_info* infos, bool win_history)
 {
     if (!s_textlist)
         return popup_result::error;
 
     assert(current >= 0);
     assert(current < count);
-    return s_textlist->activate("History", history, count, current, true/*reverse*/, history_mode, infos, false);
+    textlist_mode mode = win_history ? textlist_mode::win_history : textlist_mode::history;
+    return s_textlist->activate("History", history, count, current, true/*reverse*/, mode, infos, false);
 }

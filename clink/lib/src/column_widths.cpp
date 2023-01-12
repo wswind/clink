@@ -9,8 +9,10 @@
 #include "matches_lookaside.h"
 #include "match_adapter.h"
 #include "column_widths.h"
+#include "ellipsify.h"
 
 #include <core/base.h>
+#include <core/path.h>
 #include <core/debugheap.h>
 
 extern "C" {
@@ -26,10 +28,7 @@ int __stat_char(const char *filename, char match_type);
 #include <vector>
 #include <assert.h>
 
-#define ELLIPSIS_LEN 3
-
-typedef void (*vstrlen_func_t)(const char* s, int len);
-int ellipsify_to_callback(const char* in, int limit, int expand_ctrl, vstrlen_func_t callback);
+#define ELLIPSIS_LEN ellipsis_len
 
 //------------------------------------------------------------------------------
 /* Information about filling a column.  */
@@ -45,21 +44,6 @@ struct column_info
 static struct column_info *s_column_info = nullptr;
 
 
-
-//------------------------------------------------------------------------------
-static const char* visible_part(const char *match)
-{
-    const char* t1 = __printable_part((char*)match);
-    if (ISALPHA ((unsigned char)t1[0]) && t1[1] == ':' && t1[2] == '\0')
-        t1 += 2;
-    if (!rl_filename_display_desired)
-        return t1;
-    // check again in case of /usr/src/
-    const char* t2 = rl_last_path_separator(t1);
-    if (!t2)
-        return t1;
-    return t2 + 1;
-}
 
 //------------------------------------------------------------------------------
 int printable_len(const char* match, match_type type)
@@ -163,7 +147,7 @@ static bool init_column_info(int max_matches, size_t& max_cols, size_t count, wi
 //------------------------------------------------------------------------------
 // Calculate the number of columns needed to represent the current set of
 // matches in the current display width.
-column_widths calculate_columns(match_adapter* adapter, int max_matches, bool one_column, bool omit_desc, width_t extra)
+column_widths calculate_columns(match_adapter* adapter, int max_matches, bool one_column, bool omit_desc, width_t extra, int presuf)
 {
     column_widths widths;
 
@@ -195,27 +179,14 @@ column_widths calculate_columns(match_adapter* adapter, int max_matches, bool on
     {
         str<32> lcd;
         adapter->get_lcd(lcd);
-        const char* t = visible_part(lcd.c_str());
-        common_length = __fnwidth(t);
-        sind = strlen(t);
+        if (lcd.length() > 0 && !path::is_separator(lcd.c_str()[lcd.length() - 1]))
+        {
+            const char* t = __printable_part(const_cast<char*>(lcd.c_str()));
+            common_length = __fnwidth(t);
+            sind = strlen(t);
+        }
 
         can_condense = (common_length > _rl_completion_prefix_display_length && common_length > ELLIPSIS_LEN);
-        if (can_condense)
-        {
-            // Ellipsis can't be applied to matches that use a display string,
-            // unless the match string is an exact prefix of the display string.
-            for (int l = 0; l < count; l++)
-            {
-                match_type type = adapter->get_match_type(l);
-                const char *match = adapter->get_match(l);
-                bool append = adapter->is_append_display(l);
-                if (adapter->use_display(l, type, append) && !append)
-                {
-                    can_condense = false;
-                    break;
-                }
-            }
-        }
         if (can_condense)
             condense_delta = common_length - ELLIPSIS_LEN;
         else
@@ -227,9 +198,12 @@ column_widths calculate_columns(match_adapter* adapter, int max_matches, bool on
     {
         str<32> lcd;
         adapter->get_lcd(lcd);
-        const char* t = visible_part(lcd.c_str());
-        common_length = __fnwidth(t);
-        sind = strlen(t);
+        if (lcd.length() > 0 && !path::is_separator(lcd.c_str()[lcd.length() - 1]))
+        {
+            const char* t = __printable_part(const_cast<char*>(lcd.c_str()));
+            common_length = __fnwidth(t);
+            sind = strlen(t);
+        }
     }
 #endif
 
@@ -242,6 +216,7 @@ column_widths calculate_columns(match_adapter* adapter, int max_matches, bool on
     {
         size_t len = extra;
 
+        int cdelta = condense_delta;
         match_type type = adapter->get_match_type(i);
         const char *match = adapter->get_match(i);
         bool append = adapter->is_append_display(i);
@@ -249,20 +224,32 @@ column_widths calculate_columns(match_adapter* adapter, int max_matches, bool on
         {
             if (append)
             {
-                char *temp = __printable_part((char*)match);
                 len += printable_len(match, type);
+                len += adapter->get_match_visible_display(i);
             }
-            len += adapter->get_match_visible_display(i);
+            else if (presuf)
+            {
+                len += adapter->get_match_visible_display(i);
+            }
+            else
+            {
+                len += adapter->get_match_visible_display(i);
+                cdelta = 0;
+            }
         }
         else
         {
             len += printable_len(match, type);
         }
 
-        if (condense_delta)
+        if (cdelta)
         {
-            assert(len >= condense_delta);
-            len -= condense_delta;
+            const char *visible = __printable_part(const_cast<char*>(match));
+            if (strlen(visible) > sind)
+            {
+                assert(len >= cdelta);
+                len -= cdelta;
+            }
         }
 
         if (max_match < len)
@@ -313,9 +300,6 @@ column_widths calculate_columns(match_adapter* adapter, int max_matches, bool on
         if (max_cols > max_valid + 1)
             max_cols = max_valid + 1;
     }
-
-    assert(common_length <= max_len);
-    assert(sind <= max_len);
 
     widths.m_col_padding = col_padding;
     widths.m_desc_padding = desc_padding;

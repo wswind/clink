@@ -15,12 +15,12 @@ end
 
 --------------------------------------------------------------------------------
 -- Returns true when canceled; otherwise nil.
-local function _do_suggest(line, lines, matches)
+local function _do_suggest(line, lines, matches) -- luacheck: no unused
     -- Reset cancel flag.
     _cancel = nil
 
     -- Protected call to suggesters.
-    local impl = function(line, matches)
+    local impl = function(line, matches) -- luacheck: ignore 432
         local suggestion, offset
         local strategy = settings.get("autosuggest.strategy"):explode()
         for _, name in ipairs(strategy) do
@@ -200,15 +200,16 @@ function clink._diag_suggesters()
     end
 
     local any = false
+    local fmt = "  %-"..maxlen.."s  :  %s"
     for _,entry in ipairs(list) do
         if entry.suggest then
             local info = debug.getinfo(entry.suggest, 'S')
-            if info.short_src ~= "?" then
+            if not clink._is_internal_script(info.short_src) then
                 if not any then
                     clink.print(bold.."suggesters:"..norm)
                     any = true
                 end
-                clink.print("  "..entry.name..":"..string.rep(" ", 2 + maxlen - entry.len)..info.short_src..":"..info.linedefined)
+                clink.print(string.format(fmt, entry.name, info.short_src..":"..info.linedefined))
             end
         end
     end
@@ -217,7 +218,7 @@ end
 
 
 --------------------------------------------------------------------------------
-local function suffix(line, suggestion, minlen)
+local function suffix(line, suggestion, minlen) -- luacheck: no unused
     if suggestion then
         local info = line:getwordinfo(line:getwordcount())
         local endword = line:getline():sub(info.offset, line:getcursor())
@@ -230,29 +231,29 @@ end
 
 --------------------------------------------------------------------------------
 local history_suggester = clink.suggester("history")
-function history_suggester:suggest(line, matches)
+function history_suggester:suggest(line, matches) -- luacheck: no unused
     return clink.history_suggester(line:getline(), false)
 end
 
 --------------------------------------------------------------------------------
 local prevcmd_suggester = clink.suggester("match_prev_cmd")
-function prevcmd_suggester:suggest(line, matches)
+function prevcmd_suggester:suggest(line, matches) -- luacheck: no unused
     return clink.history_suggester(line:getline(), true)
 end
 
 --------------------------------------------------------------------------------
 local completion_suggester = clink.suggester("completion")
-function completion_suggester:suggest(line, matches)
+function completion_suggester:suggest(line, matches) -- luacheck: no unused
     local count = line:getwordcount()
     if count > 0 then
         local info = line:getwordinfo(count)
         if info.offset < line:getcursor() then
             local typed = line:getline():sub(info.offset, line:getcursor())
-            for i = 1, 5, 1 do
+            for i = 1, 10, 1 do
                 local m = matches:getmatch(i)
                 if not m then
                     break
-                elseif m ~= typed then
+                elseif m ~= typed and (info.quoted or not rl.needquotes(m)) then
                     return m, info.offset
                 end
             end

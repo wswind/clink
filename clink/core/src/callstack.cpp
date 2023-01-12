@@ -389,6 +389,14 @@ static DWORD stackframe_from_context(CONTEXT* context, STACKFRAME* stackframe)
     stackframe->AddrFrame.Offset    = context->Rbp;
     stackframe->AddrFrame.Mode      = AddrModeFlat;
     return IMAGE_FILE_MACHINE_AMD64;
+#elif defined(_M_ARM64)
+    stackframe->AddrPC.Offset       = context->Pc;
+    stackframe->AddrPC.Mode         = AddrModeFlat;
+    stackframe->AddrStack.Offset    = context->Sp;
+    stackframe->AddrStack.Mode      = AddrModeFlat;
+    stackframe->AddrFrame.Offset    = context->Fp;
+    stackframe->AddrFrame.Mode      = AddrModeFlat;
+    return IMAGE_FILE_MACHINE_ARM64;
 #else
 #error Unknown Target Machine
 #endif
@@ -441,7 +449,7 @@ static DWORD_PTR WINAPI get_module_base(HANDLE process, DWORD_PTR addr)
     return load_module_symbols(reinterpret_cast<void*>(addr));
 }
 
-CALLSTACK_EXTERN_C size_t format_callstack(int skip_frames, int total_frames, char* buffer, size_t capacity)
+CALLSTACK_EXTERN_C size_t format_callstack(int skip_frames, int total_frames, char* buffer, size_t capacity, int newlines)
 {
     void* frames[40];
     if (total_frames > _countof(frames))
@@ -449,7 +457,7 @@ CALLSTACK_EXTERN_C size_t format_callstack(int skip_frames, int total_frames, ch
 
     DWORD hash;
     const int captured = get_callstack_frames(skip_frames, total_frames, frames, &hash);
-    return format_frames(captured, frames, hash, buffer, capacity, true);
+    return format_frames(captured, frames, hash, buffer, capacity, newlines);
 }
 
 CALLSTACK_EXTERN_C int get_callstack_frames(int skip_frames, int total_frames, void** frames, DWORD* hash)
@@ -605,7 +613,7 @@ void __cdecl _wassert(wchar_t const* message, wchar_t const* file, unsigned line
 {
     char stack[4096];
     wchar_t wstack[4096];
-    format_callstack(1, 20, stack, _countof(stack));
+    format_callstack(1, 20, stack, _countof(stack), true);
     MultiByteToWideChar(CP_ACP, 0, stack, -1, wstack, _countof(wstack));
 
     wchar_t tmp[32];

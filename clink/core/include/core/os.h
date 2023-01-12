@@ -63,6 +63,8 @@ struct cwd_restorer
     wchar_t m_path[288];
 };
 
+DWORD   get_file_attributes(const wchar_t* path, bool* symlink=nullptr);
+DWORD   get_file_attributes(const char* path, bool* symlink=nullptr);
 int     get_path_type(const char* path);
 int     get_drive_type(const char* path, unsigned int len=-1);
 int     get_file_size(const char* path);
@@ -88,6 +90,7 @@ double  clock();
 time_t  filetime_to_time_t(const FILETIME& ft);
 bool    get_clipboard_text(str_base& out);
 bool    set_clipboard_text(const char* text, int length);
+bool    disambiguate_abbreviated_path(const char*& in, str_base& out);
 
 #if 0
 void    append_argv(str_base& out, const char* arg, argv_quote_mode mode);

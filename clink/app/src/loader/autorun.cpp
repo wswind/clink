@@ -87,7 +87,7 @@ static int get_value(HKEY key, const char* _name, char** _buffer)
         {
             // len is the buffer size, so find the string length.
             len = int(strlen(out));
-assert(len);
+            assert(len);
             *_buffer = out;
             out = nullptr;
         }
@@ -149,8 +149,10 @@ static bool find_clink_entry(const char* value, int* left, int* right)
         "clink\" inject",
         "clink_x64.exe inject",
         "clink_x86.exe inject",
+        "clink_arm64.exe inject",
         "clink_x64.exe\" inject",
         "clink_x86.exe\" inject",
+        "clink_arm64.exe\" inject",
         "clink.bat inject",
         "clink.bat\" inject",
     };
@@ -410,10 +412,10 @@ static bool dispatch(dispatch_func_t* function, const char* clink_path)
 static void print_help()
 {
     static const char* const help_verbs[] = {
-        "install [-- <args...>]", "Installs a command to cmd.exe's autorun to start Clink",
-        "uninstall",         "Does the opposite of 'install'",
-        "show",              "Displays the values of cmd.exe's autorun variables",
-        "set <string...>",   "Explicitly sets cmd.exe's autorun to <string>",
+        "install [-- <args...>]", "Installs a command to cmd.exe's autorun to start Clink.",
+        "uninstall",         "Does the opposite of 'install'.",
+        "show",              "Displays the values of cmd.exe's autorun variables.",
+        "set <string...>",   "Explicitly sets cmd.exe's autorun to <string>.",
         nullptr
     };
 
@@ -530,7 +532,7 @@ int autorun(int argc, char** argv)
     // Do the magic.
     if (!check_registry_access())
     {
-        puts("You must have administator rights to access cmd.exe's autorun");
+        puts("You must have administrator rights to access cmd.exe's autorun.");
         return 1;
     }
 

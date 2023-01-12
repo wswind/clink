@@ -8,6 +8,8 @@
 
 #include <core/base.h>
 #include <core/str.h>
+#include <core/str_iter.h>
+#include <terminal/ecma48_wrapper.h>
 
 extern "C" {
 #include <getopt.h>
@@ -21,9 +23,25 @@ int history(int, char**);
 int inject(int, char**);
 int input_echo(int, char**);
 int set(int, char**);
+int update(int, char**);
 int installscripts(int, char**);
 int uninstallscripts(int, char**);
 int testbed(int, char**);
+
+//------------------------------------------------------------------------------
+bool g_elevated = false;
+
+//------------------------------------------------------------------------------
+static void print_with_wrapping(int max_len, const char* arg, const char* desc, unsigned int wrap)
+{
+    str<128> buf;
+    ecma48_wrapper wrapper(desc, wrap);
+    while (wrapper.next(buf))
+    {
+        printf("  %-*s  %s", max_len, arg, buf.c_str());
+        arg = "";
+    }
+}
 
 //------------------------------------------------------------------------------
 void puts_help(const char* const* help_pairs, const char* const* other_pairs=nullptr)
@@ -35,11 +53,26 @@ void puts_help(const char* const* help_pairs, const char* const* other_pairs=nul
         for (int i = 0; other_pairs[i]; i += 2)
             max_len = max((int)strlen(other_pairs[i]), max_len);
 
+    DWORD wrap = 78;
+#if 0
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi))
+    {
+        if (csbi.dwSize.X >= 40)
+            csbi.dwSize.X -= 2;
+        wrap = max<DWORD>(wrap, min<DWORD>(100, csbi.dwSize.X));
+    }
+#endif
+    if (wrap <= DWORD(max_len + 20))
+        wrap = 0;
+    if (wrap)
+        wrap -= 2 + max_len + 2;
+
     for (int i = 0; help_pairs[i]; i += 2)
     {
         const char* arg = help_pairs[i];
         const char* desc = help_pairs[i + 1];
-        printf("  %-*s  %s\n", max_len, arg, desc);
+        print_with_wrapping(max_len, arg, desc, wrap);
     }
 
     puts("");
@@ -50,21 +83,22 @@ static void show_usage()
 {
     static const char* help_usage = "Usage: [options] <verb> [verb_options]\n";
     static const char* help_verbs[] = {
-        "inject",          "Injects Clink into a process",
-        "autorun",         "Manage Clink's entry in cmd.exe's autorun",
-        "set",             "Adjust Clink's settings",
-        "installscripts",  "Add a path to search for scripts",
-        "uninstallscripts","Remove a path to search for scripts",
-        "history",         "List and operate on the command history",
-        "info",            "Prints information about Clink",
-        "echo",            "Echo key sequences for use in .inputrc files",
+        "inject",          "Injects Clink into a process.",
+        "autorun",         "Manage Clink's entry in cmd.exe's autorun.",
+        "set",             "Adjust Clink's settings.",
+        "update",          "Check for an update for Clink.",
+        "installscripts",  "Add a path to search for scripts.",
+        "uninstallscripts","Remove a path to search for scripts.",
+        "history",         "List and operate on the command history.",
+        "info",            "Prints information about Clink.",
+        "echo",            "Echo key sequences for use in .inputrc files.",
         "",                "('<verb> --help' for more details)",
         nullptr
     };
     static const char* help_options[] = {
-        "--profile <dir>", "Use <dir> as Clink's profile directory",
-        "--session <id>",  "Override Clink's session id (for history and info)",
-        "--version",       "Print Clink's version and exit",
+        "--profile <dir>", "Use <dir> as Clink's profile directory.",
+        "--session <id>",  "Override Clink's session id (for history and info).",
+        "--version",       "Print Clink's version and exit.",
         nullptr
     };
 
@@ -94,6 +128,7 @@ static int dispatch_verb(const char* verb, int argc, char** argv)
         "info",                 clink_info,
         "inject",               inject,
         "set",                  set,
+        "update",               update,
         "installscripts",       installscripts,
         "uninstallscripts",     uninstallscripts,
         "testbed",              testbed,
@@ -129,11 +164,13 @@ int loader(int argc, char** argv)
     int session = 0;
 
     struct option options[] = {
-        { "help",    no_argument,       nullptr, 'h' },
-        { "profile", required_argument, nullptr, 'p' },
-        { "session", required_argument, nullptr, '~' },
-        { "version", no_argument,       nullptr, 'v' },
-        { nullptr,   0,                 nullptr, 0 }
+        { "help",     no_argument,       nullptr, 'h' },
+        { "profile",  required_argument, nullptr, 'p' },
+        { "session",  required_argument, nullptr, '~' },
+        { "version",  no_argument,       nullptr, 'v' },
+        // Undocumented; for internal use by the 'update' command.
+        { "elevated", no_argument,       nullptr, '%' },
+        { nullptr,    0,                 nullptr, 0 }
     };
 
     // Without arguments, show help.
@@ -163,6 +200,10 @@ int loader(int argc, char** argv)
 
         case '~':
             app_desc.id = atoi(optarg);
+            break;
+
+        case '%':
+            g_elevated = true;
             break;
 
         case '?':

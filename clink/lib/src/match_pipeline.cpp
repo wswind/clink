@@ -127,11 +127,19 @@ inline bool sort_worker(wstr_base& l, match_type l_type,
     }
 
     // Sort next by the strings.
-    cmp = CompareStringW(LOCALE_USER_DEFAULT, flags,
-                            l_str, l.length(),
-                            r_str, r.length());
+    cmp = CompareStringW(LOCALE_USER_DEFAULT, flags, l_str, l.length(), r_str, r.length());
     cmp -= CSTR_EQUAL;
     if (cmp) return (cmp < 0);
+
+    // If case insensitive sort, then compare again as case sensitive, for
+    // consistent ordering.
+    if (flags & LINGUISTIC_IGNORECASE)
+    {
+        flags &= ~LINGUISTIC_IGNORECASE;
+        cmp = CompareStringW(LOCALE_USER_DEFAULT, flags, l_str, l.length(), r_str, r.length());
+        cmp -= CSTR_EQUAL;
+        if (cmp) return (cmp < 0);
+    }
 
     // Finally sort by type (dir, alias, command, word, arg, file).
     unsigned char t1 = ((unsigned char)l_type) & MATCH_TYPE_MASK;
@@ -156,6 +164,16 @@ inline bool sort_worker(wstr_base& l, match_type l_type,
     if (cmp) return (cmp < 0);
 
     return (cmp < 0);
+}
+
+//------------------------------------------------------------------------------
+bool compare_matches(const char* l, match_type l_type, const char* r, match_type r_type)
+{
+    wstr<> ltmp;
+    wstr<> rtmp;
+    to_utf16(ltmp, l);
+    to_utf16(rtmp, r);
+    return sort_worker(ltmp, l_type, rtmp, r_type, g_sort_dirs.get());
 }
 
 //------------------------------------------------------------------------------
@@ -250,12 +268,11 @@ void match_pipeline::restrict(str_base& needle) const
 {
     const int count = m_matches.get_info_count();
 
-    char* expanded = nullptr;
-    if (rl_complete_with_tilde_expansion)
+    str<> expanded;
+    if (rl_complete_with_tilde_expansion && needle.c_str()[0] == '~')
     {
-        expanded = tilde_expand(needle.c_str());
-        if (expanded && strcmp(needle.c_str(), expanded) != 0)
-            needle = expanded;
+        if (path::tilde_expand(needle.c_str(), expanded))
+            needle = expanded.c_str();
     }
 
     if (count)
@@ -293,12 +310,11 @@ void match_pipeline::select(const char* needle) const
 {
     const int count = m_matches.get_info_count();
 
-    char* expanded = nullptr;
-    if (rl_complete_with_tilde_expansion)
+    str<> expanded;
+    if (rl_complete_with_tilde_expansion && needle[0] == '~')
     {
-        expanded = tilde_expand(needle);
-        if (expanded && strcmp(needle, expanded) != 0)
-            needle = expanded;
+        if (path::tilde_expand(needle, expanded))
+            needle = expanded.c_str();
     }
 
     if (count)
@@ -327,8 +343,6 @@ void match_pipeline::select(const char* needle) const
                m_matches.get_match_count());
     }
 #endif
-
-    free(expanded);
 }
 
 //------------------------------------------------------------------------------

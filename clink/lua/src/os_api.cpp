@@ -214,6 +214,12 @@ int execute_thread::results(lua_State* state)
 /// -ret:   boolean
 /// Changes the current directory to <span class="arg">path</span> and returns
 /// whether it was successful.
+/// If unsuccessful it returns false, an error message, and the error number.
+//------------------------------------------------------------------------------
+/// -name:  clink.chdir
+/// -deprecated: os.chdir
+/// -arg:   path:string
+/// -ret:   boolean
 int set_current_dir(lua_State* state)
 {
     const char* dir = checkstring(state, 1);
@@ -229,6 +235,10 @@ int set_current_dir(lua_State* state)
 /// -ver:   1.0.0
 /// -ret:   string
 /// Returns the current directory.
+//------------------------------------------------------------------------------
+/// -name:  clink.get_cwd
+/// -deprecated: os.getcwd
+/// -ret:   string
 int get_current_dir(lua_State* state)
 {
     str<288> dir;
@@ -245,6 +255,7 @@ int get_current_dir(lua_State* state)
 /// -ret:   boolean
 /// Creates the directory <span class="arg">path</span> and returns whether it
 /// was successful.
+/// If unsuccessful it returns false, an error message, and the error number.
 static int make_dir(lua_State* state)
 {
     const char* dir = checkstring(state, 1);
@@ -262,6 +273,7 @@ static int make_dir(lua_State* state)
 /// -ret:   boolean
 /// Removes the directory <span class="arg">path</span> and returns whether it
 /// was successful.
+/// If unsuccessful it returns false, an error message, and the error number.
 static int remove_dir(lua_State* state)
 {
     const char* dir = checkstring(state, 1);
@@ -305,6 +317,71 @@ static int is_file(lua_State* state)
 }
 
 //------------------------------------------------------------------------------
+/// -name:  os.getdrivetype
+/// -ver:   1.3.37
+/// -arg:   path:string
+/// -ret:   string
+/// Returns the drive type for the drive associated with the specified
+/// <span class="arg">path</span>.
+///
+/// Relative paths automatically use the current drive.  Absolute paths use the
+/// specified drive.  UNC paths are always reported as remote drives.
+///
+/// The possible drive types are:
+/// <p><table>
+/// <tr><th>Type</th><th>Description</th></tr>
+/// <tr><td>"unknown"</td><td>The drive type could not be determined.</td></tr>
+/// <tr><td>"invalid"</td><td>The drive type is invalid; for example, there is no volume mounted at the specified path.</td></tr>
+/// <tr><td>"removable"</td><td>Floppy disk drive, thumb drive, flash card reader, CD-ROM, etc.</td></tr>
+/// <tr><td>"fixed"</td><td>Hard drive, solid state drive, etc.</td></tr>
+/// <tr><td>"ramdisk"</td><td>RAM disk.</td></tr>
+/// <tr><td>"remote"</td><td>Remote (network) drive.</td></tr>
+/// </table></p>
+/// -show:  local t = os.getdrivetype("c:")
+/// -show:  if t == "remote" then
+/// -show:  &nbsp;   -- Network paths are often slow, and code may want to detect and skip them.
+/// -show:  end
+static int get_drive_type(lua_State* state)
+{
+    const char* path = checkstring(state, 1);
+    if (!path)
+        return 0;
+
+    int type = os::drive_type_unknown;
+    if (path::is_unc(path))
+    {
+        type = os::drive_type_remote;
+    }
+    else
+    {
+        str<> full;
+        if (os::get_full_path_name(path, full))
+        {
+            path::get_drive(full);
+            path::append(full, ""); // Because get_drive_type() requires a trailing path separator.
+            type = os::get_drive_type(path);
+        }
+    }
+
+    const char* ret;
+    switch (type)
+    {
+    default:
+        assert(false);
+        // fallthrough...
+    case os::drive_type_unknown:    ret = "unknown"; break;
+    case os::drive_type_invalid:    ret = "invalid"; break;
+    case os::drive_type_remote:     ret = "remote"; break;      // Remote (network) drive.
+    case os::drive_type_removable:  ret = "removable"; break;   // Floppy, thumb drive, flash card reader, CD-ROM, etc.
+    case os::drive_type_fixed:      ret = "fixed"; break;       // Hard drive, flash drive, etc.
+    case os::drive_type_ramdisk:    ret = "ramdisk"; break;     // RAM disk.
+    }
+
+    lua_pushstring(state, ret);
+    return 1;
+}
+
+//------------------------------------------------------------------------------
 /// -name:  os.ishidden
 /// -deprecated: os.globfiles
 /// -arg:   path:string
@@ -327,6 +404,7 @@ static int is_hidden(lua_State* state)
 /// -ret:   boolean
 /// Deletes the file <span class="arg">path</span> and returns whether it was
 /// successful.
+/// If unsuccessful it returns false, an error message, and the error number.
 static int unlink(lua_State* state)
 {
     const char* path = checkstring(state, 1);
@@ -345,6 +423,7 @@ static int unlink(lua_State* state)
 /// -ret:   boolean
 /// Moves the <span class="arg">src</span> file to the
 /// <span class="arg">dest</span> file.
+/// If unsuccessful it returns false, an error message, and the error number.
 static int move(lua_State* state)
 {
     const char* src = checkstring(state, 1);
@@ -364,6 +443,7 @@ static int move(lua_State* state)
 /// -ret:   boolean
 /// Copies the <span class="arg">src</span> file to the
 /// <span class="arg">dest</span> file.
+/// If unsuccessful it returns false, an error message, and the error number.
 static int copy(lua_State* state)
 {
     const char* src = checkstring(state, 1);
@@ -536,10 +616,10 @@ int globber_impl(lua_State* state, bool dirs_only, bool back_compat=false)
 /// of tables instead, where each sub-table corresponds to one directory and has
 /// the following scheme:
 /// -show:  local t = os.globdirs(pattern, extrainfo)
-/// -show:  -- Included when extrainfo is true or >= 1:
+/// -show:  -- Included when extrainfo is true or >= 1 (requires v1.1.7 or higher):
 /// -show:  --   t[index].name      -- [string] The directory name.
 /// -show:  --   t[index].type      -- [string] The match type (see below).
-/// -show:  -- Included when extrainfo is 2:
+/// -show:  -- Included when extrainfo is 2 (requires v1.2.31 or higher):
 /// -show:  --   t[index].size      -- [number] The file size, in bytes.
 /// -show:  --   t[index].atime     -- [number] The access time, compatible with os.time().
 /// -show:  --   t[index].mtime     -- [number] The modified time, compatible with os.time().
@@ -572,10 +652,10 @@ int glob_dirs(lua_State* state)
 /// of tables instead, where each sub-table corresponds to one file or directory
 /// and has the following scheme:
 /// -show:  local t = os.globfiles(pattern, extrainfo)
-/// -show:  -- Included when extrainfo is true or >= 1:
-/// -show:  --   t[index].name      -- [string] The directory name.
+/// -show:  -- Included when extrainfo is true or >= 1 (requires v1.1.7 or higher):
+/// -show:  --   t[index].name      -- [string] The file or directory name.
 /// -show:  --   t[index].type      -- [string] The match type (see below).
-/// -show:  -- Included when extrainfo is 2:
+/// -show:  -- Included when extrainfo is 2 (requires v1.2.31 or higher):
 /// -show:  --   t[index].size      -- [number] The file size, in bytes.
 /// -show:  --   t[index].atime     -- [number] The access time, compatible with os.time().
 /// -show:  --   t[index].mtime     -- [number] The modified time, compatible with os.time().
@@ -613,7 +693,10 @@ int make_file_globber(lua_State* state)
 /// -arg:   path:string
 /// -arg:   [atime:number]
 /// -arg:   [mtime:number]
-/// Sets the access and modified times for <span class="arg">path</span>.
+/// -ret:   boolean
+/// Sets the access and modified times for <span class="arg">path</span>, and
+/// returns whether it was successful.
+/// If unsuccessful it returns false, an error message, and the error number.
 ///
 /// The second argument is <span class="arg">atime</span> and is a time to set
 /// as the file's access time.  If omitted, the current time is used.  If
@@ -662,14 +745,20 @@ int touch(lua_State* state)
 ///
 /// <table>
 /// <tr><th>Name</th><th>Special Behavior</th></tr>
-/// <tr><td><code>"HOME"</code></td><td>If %HOME% is not set then a return value
-///     is synthesized from %HOMEDRIVE% and %HOMEPATH%, or from
-///     %USERPROFILE%.</td></tr>
-/// <tr><td><code>"ERRORLEVEL"</code></td><td>When the
+/// <tr><td><code>"CD"</code></td><td>If %CD% is not set then a return value
+///     is synthesized from the current working directory path name.</td></tr>
+/// <tr><td><code>"CMDCMDLINE"</code></td><td>If %CMDCMDLINE% is not set then
+///     this returns the command line that started the CMD process.</td></tr>
+/// <tr><td><code>"ERRORLEVEL"</code></td><td>If %ERRORLEVEL% is not set and the
 ///     <code>cmd.get_errorlevel</code> setting is enabled (it is off by
 ///     default) this returns the most recent exit code, just like the
 ///     <code>echo %ERRORLEVEL%</code> command displays.  Otherwise this returns
 ///     0.</td></tr>
+/// <tr><td><code>"HOME"</code></td><td>If %HOME% is not set then a return value
+///     is synthesized from %HOMEDRIVE% and %HOMEPATH%, or from
+///     %USERPROFILE%.</td></tr>
+/// <tr><td><code>"RANDOM"</code></td><td>If %RANDOM% is not set then this
+///     returns a random integer.</td></tr>
 /// </table>
 int get_env(lua_State* state)
 {
@@ -695,6 +784,7 @@ int get_env(lua_State* state)
 /// -ret:   boolean
 /// Sets the <span class="arg">name</span> environment variable to
 /// <span class="arg">value</span> and returns whether it was successful.
+/// If unsuccessful it returns false, an error message, and the error number.
 int set_env(lua_State* state)
 {
     const char* name = checkstring(state, 1);
@@ -920,6 +1010,51 @@ int resolve_alias(lua_State* state)
 }
 
 //------------------------------------------------------------------------------
+int get_screen_info_impl(lua_State* state, bool back_compat)
+{
+    int i;
+    int values[4];
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+
+    GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi);
+    values[0] = csbi.dwSize.X;
+    values[1] = csbi.dwSize.Y;
+    values[2] = csbi.srWindow.Right - csbi.srWindow.Left;
+    values[3] = csbi.srWindow.Bottom - csbi.srWindow.Top;
+
+    lua_createtable(state, 0, 4);
+    {
+        static const char* const newnames[] = {
+            "bufwidth",
+            "bufheight",
+            "winwidth",
+            "winheight",
+        };
+
+        static const char* const oldnames[] = {
+            "buffer_width",
+            "buffer_height",
+            "window_width",
+            "window_height",
+        };
+
+        static_assert(sizeof_array(values) == sizeof_array(newnames), "table sizes don't match");
+        static_assert(sizeof_array(values) == sizeof_array(oldnames), "table sizes don't match");
+
+        const char* const* names = back_compat ? oldnames : newnames;
+
+        for (i = 0; i < sizeof_array(values); ++i)
+        {
+            lua_pushstring(state, names[i]);
+            lua_pushinteger(state, values[i]);
+            lua_rawset(state, -3);
+        }
+    }
+
+    return 1;
+}
+
+//------------------------------------------------------------------------------
 /// -name:  os.getscreeninfo
 /// -ver:   1.1.2
 /// -ret:   table
@@ -930,42 +1065,9 @@ int resolve_alias(lua_State* state)
 /// -show:  -- info.bufheight       [integer] Height of the screen buffer.
 /// -show:  -- info.winwidth        [integer] Width of the visible window.
 /// -show:  -- info.winheight       [integer] Height of the visible window.
-int get_screen_info(lua_State* state)
+static int get_screen_info(lua_State* state)
 {
-    int i;
-    int buffer_width, buffer_height;
-    int window_width, window_height;
-    CONSOLE_SCREEN_BUFFER_INFO csbi;
-
-    struct table_t {
-        const char* name;
-        int         value;
-    };
-
-    GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi);
-    buffer_width = csbi.dwSize.X;
-    buffer_height = csbi.dwSize.Y;
-    window_width = csbi.srWindow.Right - csbi.srWindow.Left;
-    window_height = csbi.srWindow.Bottom - csbi.srWindow.Top;
-
-    lua_createtable(state, 0, 4);
-    {
-        struct table_t table[] = {
-            { "bufwidth", buffer_width },
-            { "bufheight", buffer_height },
-            { "winwidth", window_width },
-            { "winheight", window_height },
-        };
-
-        for (i = 0; i < sizeof_array(table); ++i)
-        {
-            lua_pushstring(state, table[i].name);
-            lua_pushinteger(state, table[i].value);
-            lua_rawset(state, -3);
-        }
-    }
-
-    return 1;
+    return get_screen_info_impl(state, false);
 }
 
 //------------------------------------------------------------------------------
@@ -1060,14 +1162,10 @@ int get_pid(lua_State* state)
 /// default is "t".
 ///
 /// When successful, the function returns a file handle and the file name.
+/// If unsuccessful it returns nil, an error message, and the error number.
 ///
 /// <strong>Note:</strong> Be sure to delete the file when finished, or it will
 /// be leaked.
-///
-/// If the function is unable to create a file it returns nil, an error message,
-/// and an error number.  For example if the directory is inaccessible, or if
-/// there are already too many files, or invalid file name characters are used,
-/// or etc.
 static int create_tmp_file(lua_State *state)
 {
     const char* prefix = optstring(state, 1, "");
@@ -1105,6 +1203,7 @@ static int create_tmp_file(lua_State *state)
 /// -ret:   string
 /// Returns the 8.3 short path name for <span class="arg">path</span>.  This may
 /// return the input path if an 8.3 short path name is not available.
+/// If unsuccessful it returns nil, an error message, and the error number.
 static int get_short_path_name(lua_State *state)
 {
     const char* path = checkstring(state, 1);
@@ -1122,6 +1221,7 @@ static int get_short_path_name(lua_State *state)
 /// -arg:   path:string
 /// -ret:   string
 /// Returns the long path name for <span class="arg">path</span>.
+/// If unsuccessful it returns nil, an error message, and the error number.
 static int get_long_path_name(lua_State *state)
 {
     const char* path = checkstring(state, 1);
@@ -1139,6 +1239,7 @@ static int get_long_path_name(lua_State *state)
 /// -arg:   path:string
 /// -ret:   string
 /// Returns the full path name for <span class="arg">path</span>.
+/// If unsuccessful it returns nil, an error message, and the error number.
 static int get_full_path_name(lua_State *state)
 {
     const char* path = checkstring(state, 1);
@@ -1151,12 +1252,26 @@ static int get_full_path_name(lua_State *state)
 }
 
 //------------------------------------------------------------------------------
+/// -name:  os.gettemppath
+/// -ver:   1.3.18
+/// -ret:   string
+/// Returns the path of the system temporary directory.
+/// If unsuccessful it returns nil, an error message, and the error number.
+static int get_temp_path(lua_State *state)
+{
+    str<> out;
+    bool ok = os::get_temp_dir(out);
+    return lua_osstringresult(state, out.c_str(), ok);
+}
+
+//------------------------------------------------------------------------------
 /// -name:  os.getnetconnectionname
 /// -ver:   1.2.27
 /// -arg:   path:string
 /// -ret:   string
 /// Returns the remote name associated with <span class="arg">path</span>, or an
 /// empty string if it's not a network drive.
+/// If unsuccessful it returns nil, an error message, and the error number.
 static int get_net_connection_name(lua_State *state)
 {
     const char* path = checkstring(state, 1);
@@ -1173,9 +1288,9 @@ static int get_net_connection_name(lua_State *state)
 /// -ver:   1.2.20
 /// -arg:   ...
 /// This works like <code>print()</code> but writes the output via the OS
-/// `OutputDebugString()` API.
+/// <code>OutputDebugString()</code> API.
 ///
-/// This function has no effect if the `lua.debug` Clink setting is off.
+/// This function has no effect if the <code>lua.debug</code> Clink setting is off.
 /// -show:  clink.debugprint("my variable = "..myvar)
 static int debug_print(lua_State *state)
 {
@@ -1327,6 +1442,72 @@ static int sleep(lua_State *state)
 }
 
 //------------------------------------------------------------------------------
+/// -name:  os.expandabbreviatedpath
+/// -ver:   1.4.1
+/// -arg:   path:string
+/// -ret:   nil | string, string, boolean
+/// This expands any abbreviated directory components in
+/// <span class="arg">path</span>.
+///
+/// The return value is nil if <span class="arg">path</span> couldn't be
+/// expanded.  It can't be expanded if it is a UNC path or a remote drive, or if
+/// it is already expanded, or if there are no matches for one of the directory
+/// components.
+///
+/// Otherwise three values are returned.  First, a string containing the
+/// expanded part of <span class="arg">path</span>.  Second, a string containing
+/// the rest of <span class="arg">path</span> that wasn't expanded.  Third, a
+/// boolean indicating whether <span class="arg">path</span> was able to expand
+/// uniquely.
+/// -show:  -- Suppose only the following directories exist in the D: drive:
+/// -show:  --  - D:\bag
+/// -show:  --  - D:\bookkeeper
+/// -show:  --  - D:\bookkeeping
+/// -show:  --  - D:\box
+/// -show:  --  - D:\boxes
+/// -show:
+/// -show:  expanded, remaining, unique = os.expandabbreviatedpath("d:\\b\\file")
+/// -show:  -- returns "d:\\b", "\\file", false         -- Ambiguous.
+/// -show:
+/// -show:  expanded, remaining, unique = os.expandabbreviatedpath("d:\\ba\\file")
+/// -show:  -- returns "d:\\bag", "\\file", true        -- Unique; only "bag" can match "ba".
+/// -show:
+/// -show:  expanded, remaining, unique = os.expandabbreviatedpath("d:\\bo\\file")
+/// -show:  -- returns "d:\\bo", "\\file", false        -- Ambiguous.
+/// -show:
+/// -show:  expanded, remaining, unique = os.expandabbreviatedpath("d:\\boo\\file")
+/// -show:  -- returns "d:\\bookkeep", "\\file", false  -- Ambiguous; "bookkeep" is longest common part matching "boo".
+/// -show:
+/// -show:  expanded, remaining, unique = os.expandabbreviatedpath("d:\\box\\file")
+/// -show:  -- returns "d:\\box", "\\file", false       -- Ambiguous; "box" is an exact match.
+/// -show:
+/// -show:  expanded, remaining, unique = os.expandabbreviatedpath("d:\\boxe\\file")
+/// -show:  -- returns "d:\\boxes", "\\file", true      -- Unique; only "boxes" can match "boxe".
+/// -show:
+/// -show:  expanded, remaining, unique = os.expandabbreviatedpath("d:\\boxes\\file")
+/// -show:  -- returns nil                              -- Is already expanded.
+static int expand_abbreviated_path(lua_State *state)
+{
+    const char* path = checkstring(state, 1);
+    if (!path)
+        return 0;
+
+    str<> expanded;
+    const bool unique = os::disambiguate_abbreviated_path(path, expanded);
+
+    if (!expanded.length())
+    {
+        lua_pushnil(state);
+        return 1;
+    }
+
+    lua_pushlstring(state, expanded.c_str(), expanded.length());
+    lua_pushstring(state, path);
+    lua_pushboolean(state, unique);
+    return 3;
+}
+
+//------------------------------------------------------------------------------
 void os_lua_initialise(lua_state& lua)
 {
     struct {
@@ -1339,6 +1520,7 @@ void os_lua_initialise(lua_state& lua)
         { "rmdir",       &remove_dir },
         { "isdir",       &is_dir },
         { "isfile",      &is_file },
+        { "getdrivetype", &get_drive_type },
         { "ishidden",    &is_hidden },
         { "unlink",      &unlink },
         { "move",        &move },
@@ -1360,6 +1542,7 @@ void os_lua_initialise(lua_state& lua)
         { "getshortpathname", &get_short_path_name },
         { "getlongpathname", &get_long_path_name },
         { "getfullpathname", &get_full_path_name },
+        { "gettemppath", &get_temp_path },
         { "getnetconnectionname", &get_net_connection_name },
         { "debugprint",  &debug_print },
         { "clock",       &double_clock },
@@ -1368,6 +1551,7 @@ void os_lua_initialise(lua_state& lua)
         { "executeyield_internal", &os_executeyield_internal },
         { "issignaled",  &is_signaled },
         { "sleep",       &sleep },
+        { "expandabbreviatedpath", &expand_abbreviated_path },
         // UNDOCUMENTED; internal use only.
         { "_globdirs",   &glob_dirs },  // Public os.globdirs method is in core.lua.
         { "_globfiles",  &glob_files }, // Public os.globfiles method is in core.lua.

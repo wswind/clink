@@ -84,6 +84,7 @@ void path_lua_initialise(lua_state&);
 void rl_lua_initialise(lua_state&);
 void settings_lua_initialise(lua_state&);
 void string_lua_initialise(lua_state&);
+void unicode_lua_initialise(lua_state&);
 void log_lua_initialise(lua_state&);
 
 
@@ -230,6 +231,7 @@ void lua_state::initialise()
     rl_lua_initialise(self);
     settings_lua_initialise(self);
     string_lua_initialise(self);
+    unicode_lua_initialise(self);
     log_lua_initialise(self);
 
     // Load the debugger.
@@ -696,6 +698,20 @@ save_stack_top::~save_stack_top()
 {
     assert(lua_gettop(m_state) >= m_top);
     lua_settop(m_state, m_top);
+}
+
+
+
+//------------------------------------------------------------------------------
+void get_lua_srcinfo(lua_State* L, str_base& out)
+{
+    lua_Debug ar = {};
+    lua_getstack(L, 1, &ar);
+    lua_getinfo(L, "Sl", &ar);
+    const char* source = ar.source ? ar.source : "?";
+
+    out.clear();
+    out.format("%s:%d", source, ar.currentline);
 }
 
 
